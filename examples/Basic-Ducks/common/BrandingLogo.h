@@ -1,3 +1,24 @@
+/**
+ * @file BrandingLogo.h
+ * @brief Shared boot-splash logo bitmap for MamaDuck-based example sketches
+ * (Heltec, Seeed Wio Tracker L1 Pro, and any future board).
+ *
+ * This XBM bitmap (and the unused legacy activeSymbol/inactiveSymbol glyphs
+ * inherited from the original ssd1306 example template) was previously
+ * duplicated byte-for-byte as `image.h` in each board's example directory.
+ * Both the SSD1306 (Heltec, `display.drawXbm()`) and U8g2 (Seeed,
+ * `display.drawXBM()`) display libraries consume the same packed XBM byte
+ * format, so the bitmap data itself has no hardware/board dependency and is
+ * factored out here to avoid re-typing (and re-drifting) the same 100-line
+ * array in every new sketch.
+ *
+ * Lives under examples/Basic-Ducks/common/ (not src/) because it is
+ * example-sketch branding, not part of the CDP library itself.
+ */
+
+#ifndef DUCK_COMMON_BRANDING_LOGO_H_
+#define DUCK_COMMON_BRANDING_LOGO_H_
+
 #define taqisystems_small_width 106
 #define taqisystems_small_height 64
 const uint8_t taqisystems_small_bits[] PROGMEM = {
@@ -98,3 +119,5 @@ const uint8_t inactiveSymbol[] PROGMEM = {
     B00000000,
     B00000000
 };
+
+#endif // DUCK_COMMON_BRANDING_LOGO_H_

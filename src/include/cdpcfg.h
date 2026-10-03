@@ -22,6 +22,7 @@
 #include "boards/lilygo_t_beam_supreme_sx1262.h"
 #include "boards/lilygo_sim7000g_lora.h"
 #include "boards/seeed_wio_tracker_l1.h"
+#include "boards/seeed_t1000e.h"
 #endif
 
 // version definitions
@@ -31,8 +32,10 @@
 
 #define CDP_VERSION ((((CDP_VERSION_MAJOR) << 16) | ((CDP_VERSION_MINOR) << 8) | (CDP_VERSION_PATCH)))
 
-#ifdef CDPCFG_RADIO_SX1262
+#if defined(CDPCFG_RADIO_SX1262)
   #define CDPCFG_LORA_CLASS SX1262
+#elif defined(CDPCFG_RADIO_LR1110)
+  #define CDPCFG_LORA_CLASS LR1110
 #else
   #define CDPCFG_LORA_CLASS SX1276
 #endif

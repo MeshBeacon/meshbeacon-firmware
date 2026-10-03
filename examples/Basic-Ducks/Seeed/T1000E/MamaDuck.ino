@@ -1,19 +1,22 @@
 /**
- * @file MamaDuck.ino — Seeed Wio Tracker L1 Pro (nRF52840 + SX1262)
+ * @file MamaDuck.ino — Seeed SenseCAP Card Tracker T1000-E (nRF52840 + LR1110)
  * @brief MamaDuck example using ClusterDuck Protocol on the nRF52840 platform.
  *
- * Hardware: Seeed Wio Tracker L1 Pro
+ * Hardware: Seeed SenseCAP Card Tracker T1000-E
  *   - MCU:     nRF52840 @ 64 MHz
- *   - Radio:   SX1262 (SPI, TCXO 1.8 V, DIO2 RF switch)
- *   - Display: SH1106 128×64 OLED (I2C)
- *   - GPS:     L76KB NMEA (Serial1, 9600 baud)
+ *   - Radio:   LR1110 (SPI, TCXO 1.6 V, DIO5-8 RF/GNSS switch matrix)
+ *   - Display: none
+ *   - GPS:     Airoha GNSS NMEA (Serial1, 115200 baud)
  *
- * Ported from examples/Basic-Ducks/Seeed/MamaDuck.ino (ESP32 / NimBLE / Heltec).
- * Platform differences:
- *   - U8g2 replaces the Heltec SSD1306 display library.
- *   - Custom battery ADC replaces heltec_battery_percent().
- *   - Manual button debounce replaces the HotButton library.
- *   - TinyGPSPlus on Serial1 replaces UART1 custom GPS setup.
+ * Ported from examples/Basic-Ducks/Seeed/WioTrackerL1/MamaDuck.ino (nRF52840 /
+ * SX1262 / SH1106 OLED). Platform differences from that board:
+ *   - LR1110 replaces SX1262 (different radio driver branch in DuckLoRa.cpp).
+ *   - No display: all dsp*() helpers and the IDuckDisplay implementation are
+ *     no-ops (see NullDisplayAdapter below) -- this board has no OLED.
+ *   - Airoha GNSS replaces the L76KB GPS module; GPS enable/reset is handled
+ *     by variant.cpp's initVariant() before setup() runs, and no MediaTek
+ *     PMTK constellation command is sent (Airoha does not use PMTK).
+ *   - LED/button/buzzer/battery pins differ (see variant.h).
  *
  * @date 2025-07-01
  */
@@ -24,7 +27,6 @@
 #include <map>
 #include <set>
 #include <CDP.h>
-#include <U8g2lib.h>
 #include <TinyGPSPlus.h>
 #include <bluefruit.h>   // Adafruit Bluefruit52Lib — Nordic UART Service
 
@@ -67,9 +69,9 @@ static int32_t currentRssiDbm() {
 }
 
 // ── Board sanity check ────────────────────────────────────────────────────────
-#ifndef ARDUINO_SEEED_WIO_TRACKER_L1
-#error "This sketch is for the Seeed Wio Tracker L1 Pro. \
-Define ARDUINO_SEEED_WIO_TRACKER_L1 (or use env:local_wio_tracker_l1)."
+#ifndef ARDUINO_SEEED_T1000E
+#error "This sketch is for the Seeed SenseCAP Card Tracker T1000-E. \
+Define ARDUINO_SEEED_T1000E (or use env:local_t1000e)."
 #endif
 
 // ── Identification ────────────────────────────────────────────────────────────
@@ -93,17 +95,11 @@ static bool gpsModuleDetected = false;
 static bool gpsFix            = false;
 
 // ── Display ───────────────────────────────────────────────────────────────────
-// SH1106 128×64 software I2C (bit-bang GPIO).
-// SW I2C bypasses TWIM entirely, so it works both before AND after
-// sd_softdevice_enable() — unlike Wire/HW-I2C which hangs post-sd_enable.
-// SCL = D15 = P0.05, SDA = D14 = P0.06 (same physical pins as HW I2C).
-U8G2_SH1106_128X64_NONAME_F_SW_I2C display(U8G2_R0, /*clock/SCL*/15, /*data/SDA*/14, U8X8_PIN_NONE);
-
-// U8g2 uses baseline y-coordinates.  These helpers mirror the heltec library's
-// top-left convention so ported code can use integer pixel rows (0 = top).
-// All measurements are for u8g2_font_6x10_tf:  ascent = 8 px, height = 10 px.
-#define DSP_LINE_H  13   // pixel rows between lines (generous for readability)
-#define DSP_ASCENT   8   // ascent of u8g2_font_6x10_tf
+// This board has no display of any kind (HAS_SCREEN 0 in variant.h). All the
+// dsp*() helpers and the IDuckDisplay implementation below are no-ops so the
+// rest of this sketch (ported from a board with an OLED) compiles and runs
+// unchanged -- every dspStr()/dspBegin()/etc. call elsewhere in this file is
+// a harmless no-op on this hardware.
 
 // enum BtnEvent is declared near the top of the file (right before
 // currentRssiDbm()) so it precedes every function definition, per
@@ -123,132 +119,37 @@ static bool initDuckId() {
 }
 static bool duckIdReady = initDuckId();
 
-// Draw string starting at top-left pixel (x, y_from_top).
-static inline void dspStr(int x, int y, const char* s) {
-    display.drawStr(x, y + DSP_ASCENT, s);
-}
-// Draw centered string.
-static inline void dspStrCenter(int y, const char* s) {
-    int w = display.getStrWidth(s);
-    display.drawStr((128 - w) / 2, y + DSP_ASCENT, s);
-}
-// Draw right-aligned string.
-static inline void dspStrRight(int y, const char* s) {
-    int w = display.getStrWidth(s);
-    display.drawStr(128 - w, y + DSP_ASCENT, s);
-}
-// Draw a multi-line string (split on '\n').  y = top of first line.
-static void dspMulti(int x, int y, const char* text) {
-    char buf[200];
-    strncpy(buf, text, sizeof(buf) - 1);
-    char* tok = strtok(buf, "\n");
-    while (tok) {
-        display.drawStr(x, y + DSP_ASCENT, tok);
-        y += DSP_LINE_H;
-        tok = strtok(nullptr, "\n");
-    }
-}
-// draw() wrapper: clear, set font, draw, send.
-static void dspBegin() {
-    display.clearBuffer();
-    display.setFont(u8g2_font_6x10_tf);
-}
-static bool gDisplayOk = false;   // true once display.begin() succeeds
-static void dspEnd() {
-    if (!gDisplayOk) return;   // skip I2C send if display not found
-    display.sendBuffer();
-}
-static inline void dspPowerSave(uint8_t on) {
-    if (gDisplayOk) display.setPowerSave(on);
-}
+static bool gDisplayOk = false;   // always false: no display hardware present
 
-// Hardware-specific implementation of the shared IDuckDisplay interface
-// (see common/DuckDisplayAdapter.h) wrapping the U8g2 `display` object
-// declared above. Only used by the 6 screen functions that are duplicated
-// between boards (displayHome/displayID/displayBatt/displayMessage/
-// displayAnnouncement/showHoldProgress) and the boot splash -- every other
-// dspStr()/dspBegin()/etc. call elsewhere in this file is untouched.
-class WioDisplayAdapter : public IDuckDisplay {
+static inline void dspStr(int /*x*/, int /*y*/, const char* /*s*/) {}
+static inline void dspStrCenter(int /*y*/, const char* /*s*/) {}
+static inline void dspStrRight(int /*y*/, const char* /*s*/) {}
+static void dspMulti(int /*x*/, int /*y*/, const char* /*text*/) {}
+static void dspBegin() {}
+static void dspEnd() {}
+static inline void dspPowerSave(uint8_t /*on*/) {}
+
+// No-op implementation of the shared IDuckDisplay interface (see
+// common/DuckDisplayAdapter.h) for this display-less board.
+class NullDisplayAdapter : public IDuckDisplay {
 public:
-  void begin() override {
-    display.clearBuffer();
-  }
-  void end() override {
-    if (!gDisplayOk) return;
-    display.sendBuffer();
-  }
-  void drawStr(int x, int yTop, const char *s) override {
-    display.setFont(u8g2_font_6x10_tf);
-    display.drawStr(x, yTop + DSP_ASCENT, s);
-  }
-  void drawStrCenter(int yTop, const char *s) override {
-    display.setFont(u8g2_font_6x10_tf);
-    int w = display.getStrWidth(s);
-    display.drawStr((128 - w) / 2, yTop + DSP_ASCENT, s);
-  }
-  void drawStrRight(int yTop, const char *s) override {
-    display.setFont(u8g2_font_6x10_tf);
-    int w = display.getStrWidth(s);
-    display.drawStr(128 - w, yTop + DSP_ASCENT, s);
-  }
-  void drawStrMaxWidth(int x, int yTop, int /*maxWidth*/, const char *s) override {
-    // No cheap real pixel word-wrap available on u8g2; matches the fixed
-    // 21-char-per-line split displayMessage()/displayAnnouncement() already
-    // used (u8g2_font_6x10_tf: ~6px/char, 128px / 6px ~= 21 chars/line).
-    display.setFont(u8g2_font_6x10_tf);
-    String text(s);
-    drawStr(x, yTop, text.substring(0, 21).c_str());
-    if (text.length() > 21) drawStr(x, yTop + 12, text.substring(21, 42).c_str());
-    if (text.length() > 42) drawStr(x, yTop + 24, text.substring(42, 63).c_str());
-  }
-  void drawXBM(int x, int y, int w, int h, const uint8_t *bits) override {
-    display.drawXBM(x, y, w, h, bits);
-  }
-  void drawProgressBar(int x, int y, int w, int h, uint8_t pct) override {
-    display.drawFrame(x, y, w, h);
-    int fillW = (int)((uint32_t)(w - 4) * pct / 100);
-    if (fillW > 0) display.drawBox(x + 2, y + 2, fillW, h - 4);
-  }
-  void powerSave(bool on) override {
-    if (gDisplayOk) display.setPowerSave(on ? 1 : 0);
-  }
+  void begin() override {}
+  void end() override {}
+  void drawStr(int /*x*/, int /*yTop*/, const char * /*s*/) override {}
+  void drawStrCenter(int /*yTop*/, const char * /*s*/) override {}
+  void drawStrRight(int /*yTop*/, const char * /*s*/) override {}
+  void drawStrMaxWidth(int /*x*/, int /*yTop*/, int /*maxWidth*/, const char * /*s*/) override {}
+  void drawXBM(int /*x*/, int /*y*/, int /*w*/, int /*h*/, const uint8_t * /*bits*/) override {}
+  void drawProgressBar(int /*x*/, int /*y*/, int /*w*/, int /*h*/, uint8_t /*pct*/) override {}
+  void powerSave(bool /*on*/) override {}
 };
-static WioDisplayAdapter gDisplay;
+static NullDisplayAdapter gDisplay;
 
-// Probe and initialise the SH1106 OLED early in setup().
-// Address is hardcoded 0x3D (confirmed by scan; SA0 pin is HIGH on this board).
-// No Wire/TWIM used — SW I2C bit-bangs GPIO directly, so TWIM never claims
-// pins D14/D15 and display works both before and after sd_softdevice_enable().
-static void initDisplay() {
-    // Give the display time to power up before first I2C access.
-    delay(50);
+// No-op: no display hardware to initialise on this board.
+static void initDisplay() {}
 
-    // SH1106 address 0x3D (7-bit) → 0x7A (8-bit as U8G2 expects).
-    display.setI2CAddress(0x3D << 1);
-    if (!display.begin()) {
-        // begin() failed — 6 fast blinks.
-        for (int i = 0; i < 6; i++) {
-            NRF_P1->OUTSET = (1u<<1); delay(80);
-            NRF_P1->OUTCLR = (1u<<1); delay(80);
-        }
-        Serial.println("[DISP] ERROR: display.begin() failed"); Serial.flush();
-        return;
-    }
-    display.setContrast(255);
-    display.setPowerSave(0);
-    display.setFont(u8g2_font_6x10_tf);
-    gDisplayOk = true;
-    // (removed success-path debug println/flush -- see setup() for rationale)
-}
-// Show 1-2 centred status lines.  No-op if display not found.
-static void dspStatus(const char* line1, const char* line2 = nullptr) {
-    if (!gDisplayOk) return;
-    display.clearBuffer();
-    display.setFont(u8g2_font_6x10_tf);
-    dspStrCenter(line2 ? 20 : 28, line1);
-    if (line2) dspStrCenter(36, line2);
-    display.sendBuffer();
-}
+// Show 1-2 centred status lines. No-op on this board (no display hardware).
+static void dspStatus(const char* /*line1*/, const char* /*line2*/ = nullptr) {}
 
 // ── BLE state ────────────────────────────────────────────────────────────────
 // Modelled directly on MeshCore's SerialBLEInterface (nrf52/SerialBLEInterface.cpp).
@@ -422,13 +323,13 @@ extern "C" __attribute__((naked, used)) void SVC_Handler(void) {
 // Override BSP's HardFault_Handler (NVIC_SystemReset) with SOS LED blinks
 // so a fault is visible without a serial monitor.  debug.cpp patched weak.
 extern "C" void HardFault_Handler(void) {
-    NRF_P1->DIRSET = (1u << 1);
+    NRF_P0->DIRSET = (1u << 24);
     while (true) {
-        for (int i=0;i<3;i++){NRF_P1->OUTSET=(1u<<1);for(volatile uint32_t d=0;d<1920000u;d++){}NRF_P1->OUTCLR=(1u<<1);for(volatile uint32_t d=0;d<1920000u;d++){}}
+        for (int i=0;i<3;i++){NRF_P0->OUTSET=(1u<<24);for(volatile uint32_t d=0;d<1920000u;d++){}NRF_P0->OUTCLR=(1u<<24);for(volatile uint32_t d=0;d<1920000u;d++){}}
         for(volatile uint32_t d=0;d<3840000u;d++){}
-        for (int i=0;i<3;i++){NRF_P1->OUTSET=(1u<<1);for(volatile uint32_t d=0;d<6400000u;d++){}NRF_P1->OUTCLR=(1u<<1);for(volatile uint32_t d=0;d<3200000u;d++){}}
+        for (int i=0;i<3;i++){NRF_P0->OUTSET=(1u<<24);for(volatile uint32_t d=0;d<6400000u;d++){}NRF_P0->OUTCLR=(1u<<24);for(volatile uint32_t d=0;d<3200000u;d++){}}
         for(volatile uint32_t d=0;d<3840000u;d++){}
-        for (int i=0;i<3;i++){NRF_P1->OUTSET=(1u<<1);for(volatile uint32_t d=0;d<1920000u;d++){}NRF_P1->OUTCLR=(1u<<1);for(volatile uint32_t d=0;d<1920000u;d++){}}
+        for (int i=0;i<3;i++){NRF_P0->OUTSET=(1u<<24);for(volatile uint32_t d=0;d<1920000u;d++){}NRF_P0->OUTCLR=(1u<<24);for(volatile uint32_t d=0;d<1920000u;d++){}}
         for(volatile uint32_t d=0;d<9600000u;d++){}
     }
 }
@@ -534,29 +435,24 @@ static void setupBLE() {
 }
 
 // ── Busy-wait LED blink helper ─────────────────────────────────────────────
-// Works without FreeRTOS tick or any library.  LED is D11 = P1.01.
+// Works without FreeRTOS tick or any library.  LED is P0.24 (PIN_LED1).
 #define BLINK_LED(n) do { \
-    NRF_P1->DIRSET = (1u<<1); \
+    NRF_P0->DIRSET = (1u<<24); \
     for(int _b=0;_b<(n);_b++){ \
-        NRF_P1->OUTSET=(1u<<1); for(volatile uint32_t _d=0;_d<9600000u;_d++){} \
-        NRF_P1->OUTCLR=(1u<<1); for(volatile uint32_t _d=0;_d<9600000u;_d++){} \
+        NRF_P0->OUTSET=(1u<<24); for(volatile uint32_t _d=0;_d<9600000u;_d++){} \
+        NRF_P0->OUTCLR=(1u<<24); for(volatile uint32_t _d=0;_d<9600000u;_d++){} \
     } \
     for(volatile uint32_t _d=0;_d<32000000u;_d++){} \
 } while(0)
 
 // ── Battery ADC ───────────────────────────────────────────────────────────────
 static float readVbat() {
-    // Drive BAT_READ HIGH to enable the battery voltage-divider (active HIGH on
-    // Seeed nRF52840 designs — a LOW gate keeps the switch open).
-    pinMode(BAT_READ, OUTPUT);
-    digitalWrite(BAT_READ, HIGH);
-    delay(5);
+    // No separate battery-read enable pin on this board (unlike WioTrackerL1's
+    // BAT_READ gate) -- BATTERY_PIN/ADC_MULTIPLIER are defined in variant.h.
     // analogReadResolution(ADC_RESOLUTION) is called in setup(), so
     // analogRead() returns a 14-bit value (0–16383).
-    float raw  = (float)analogRead(PIN_VBAT);
+    float raw  = (float)analogRead(BATTERY_PIN);
     float vbat = raw / (float)((1 << ADC_RESOLUTION) - 1) * AREF_VOLTAGE * ADC_MULTIPLIER;
-    // Return BAT_READ pin to input (Hi-Z) to save power.
-    pinMode(BAT_READ, INPUT);
     return vbat;
 }
 
@@ -604,7 +500,7 @@ static BtnEvent checkButton() {
     const uint32_t DEBOUNCE_MS    = 30;    // raw reading must be stable this long before being trusted
     const uint32_t MIN_PRESS_MS   = 30;    // debounced press must last at least this long to count as a click
 
-    bool rawNow = (digitalRead(CANCEL_BUTTON_PIN) == LOW);  // active LOW
+    bool rawNow = (digitalRead(BUTTON_PIN) == HIGH);  // active HIGH (pull-down, per variant.h)
     if (rawNow != rawDown) {
         rawDown     = rawNow;
         rawChangeMs = millis();
@@ -691,23 +587,8 @@ void setup() {
     // USB serial (debug / phone comms)
     Serial.begin(115200);
 
-    // Show display content immediately — before waiting for USB CDC so there
-    // is always visual feedback even on fast crash/reset loops.
+    // No display on this board -- initDisplay()/dspStatus() are no-ops.
     initDisplay();
-
-    // Brief branding splash. Deliberately short (~1.2 s, one blocking delay)
-    // so boot stays fast -- unlike Heltec's ~15 s blocking splash. The
-    // taqisystems_small bitmap (image.h) was already compiled in but never
-    // actually drawn before; this is the first place it's shown.
-    if (gDisplayOk) {
-        gDisplay.begin();
-        gDisplay.drawXBM((128 - taqisystems_small_width) / 2, 0,
-                         taqisystems_small_width, taqisystems_small_height,
-                         taqisystems_small_bits);
-        gDisplay.end();
-        delay(1200);
-    }
-
     dspStatus("Booting...", DUCK_NAME);
 
     // Debug println()/flush() calls that used to run unconditionally on every
@@ -724,24 +605,31 @@ void setup() {
     // this call is omitted.  14-bit gives full-scale 16383 (0x3FFF).
     analogReadResolution(ADC_RESOLUTION);
 
+    // ADC reference — variant.h defines AREF_VOLTAGE 3.0 (matching the
+    // upstream Meshtastic tracker-t1000-e variant this board is based on),
+    // but the Adafruit nRF52 BSP defaults to the internal 3.6V/1:6-gain
+    // reference if analogReference() is never called. Without this call,
+    // readVbat()'s formula (which assumes a 3.0V full-scale) silently reads
+    // ~17% low against the actual 3.6V-referenced raw ADC codes, which
+    // clamps batteryPercent() to 0% for any real battery voltage -- i.e.
+    // every CDK:BATT frame still goes out, just with LEVEL:0, which looks
+    // like "battery never gets reported" on the phone app (same failure
+    // mode documented for the Heltec board's VBAT_CTRL polarity bug).
+#ifdef VBAT_AR_INTERNAL
+    analogReference(VBAT_AR_INTERNAL);
+#endif
+
     // LED + Button + Buzzer
     pinMode(PIN_LED1,     OUTPUT);
     digitalWrite(PIN_LED1, LOW);
-    pinMode(12,           OUTPUT);              // D12 = Buzzer (active HIGH)
-    digitalWrite(12,      LOW);
-    pinMode(CANCEL_BUTTON_PIN, INPUT_PULLUP);   // active LOW
+    pinMode(PIN_BUZZER,   OUTPUT);              // active HIGH
+    digitalWrite(PIN_BUZZER, LOW);
+    pinMode(BUTTON_PIN, INPUT_PULLDOWN);        // active HIGH (per variant.h)
 
-    // GPS — wake the L76KB before starting Serial1
-    pinMode(PIN_GPS_STANDBY, OUTPUT);
-    digitalWrite(PIN_GPS_STANDBY, HIGH);   // STDBY_N high = active
+    // GPS — Airoha GNSS enable/reset sequence already ran in initVariant()
+    // (before setup()); just start the UART. No MediaTek PMTK constellation
+    // command is sent (Airoha does not use the PMTK protocol).
     Serial1.begin(GPS_BAUDRATE);
-
-    // Enable all three GNSS constellations for faster and more reliable signal acquisition.
-    // The L76KB default is GPS-only; adding GLONASS + BeiDou roughly triples visible satellites.
-    // PMTK353: GPS(1) + GLONASS(1) + BeiDou(1) + Galileo(0) + NAVIC(0) — checksum 0x2A verified.
-    delay(100);  // brief settle time after module power-on
-    Serial1.println("$PMTK353,1,1,1,0,0*2A");
-    delay(50);
 
     // initDisplay() + dspStatus("Booting...") were moved to before the Serial
     // wait at the top of setup() so the display always shows content on boot.
@@ -768,26 +656,18 @@ void setup() {
     BLINK_LED(5);   // 5 blinks = CDP fully initialized
     dspStatus("CDP OK", DUCK_NAME);
 
-    // Re-init display after CDP/LoRa are stable (before BLE, which may
-    // also disturb I2C — setupBLE() does a second re-init after begin()).
-    if (gDisplayOk) {
-        display.begin();
-        display.setContrast(255);
-        display.setPowerSave(0);
-        display.setFont(u8g2_font_6x10_tf);
-        dspStatus("CDP Ready", DUCK_NAME);
-    }
+    // Re-init display after CDP/LoRa are stable -- no-op on this board (no
+    // display hardware); kept for structural parity with the OLED-equipped
+    // ports.
+    dspStatus("CDP Ready", DUCK_NAME);
     BLINK_LED(3);
 
     // BLE init goes last — same order as MeshCore (radio/filesystem first,
     // BLE last).  setupBLE() calls Bluefruit.begin() and starts advertising.
     setupBLE();
 
-    // Re-assert GPS wakeup — BLE init can take several hundred ms.
-    digitalWrite(PIN_GPS_STANDBY, HIGH);
-
     // Re-configure button — defensive in case BLE/SD peripheral init disturbed it.
-    pinMode(CANCEL_BUTTON_PIN, INPUT_PULLUP);
+    pinMode(BUTTON_PIN, INPUT_PULLDOWN);
 
     Serial.println(String("CDK:ID,VALUE:") + DUCK_ID_BUF);
     sendBattery();
@@ -1839,18 +1719,18 @@ void blinkLed(int times) {
     }
 }
 
-// Buzzer is D12 = P1.00 (passive buzzer — needs PWM at resonant frequency to be loud).
+// Buzzer is PIN_BUZZER = P0.25 (passive buzzer — needs PWM at resonant frequency to be loud).
 // Safe to call from duck.run() callbacks: off-gaps use delay() not duck.run(),
 // avoiding recursive re-entry into the CDP stack.
 void beepBuzzer(int times, int onMs, int offMs) {
-    NRF_P1->DIRSET = (1u << 0);   // ensure D12 is output
+    NRF_P0->DIRSET = (1u << 25);   // ensure PIN_BUZZER is output
     for (int n = 0; n < times; n++) {
         // Bit-bang ~2.5 kHz square wave for the on duration.
         unsigned long endMs = millis() + (unsigned long)onMs;
         while ((long)(endMs - millis()) > 0) {
-            NRF_P1->OUTSET = (1u << 0);
+            NRF_P0->OUTSET = (1u << 25);
             delayMicroseconds(200);
-            NRF_P1->OUTCLR = (1u << 0);
+            NRF_P0->OUTCLR = (1u << 25);
             delayMicroseconds(200);
         }
         // Off gap: simple delay — safe from any call context.
@@ -1858,7 +1738,7 @@ void beepBuzzer(int times, int onMs, int offMs) {
             delay(offMs);
         }
     }
-    NRF_P1->OUTCLR = (1u << 0);   // ensure buzzer is silent after last beep
+    NRF_P0->OUTCLR = (1u << 25);   // ensure buzzer is silent after last beep
 }
 
 // ── Battery ───────────────────────────────────────────────────────────────────

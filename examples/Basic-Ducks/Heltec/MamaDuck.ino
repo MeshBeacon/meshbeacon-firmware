@@ -24,15 +24,67 @@
  #include "../common/BeaconCrypto.h"
  #include "../common/UplinkRouter.h"
  #include "../common/CdkFrame.h"
+ #include "../common/PayloadBuilders.h"
+ #include "../common/DuckDisplayAdapter.h"
+ #include "../common/PhoneGpsHandler.h"
+ #include "../common/DeferredGpsTx.h"
+ #include "../common/SignalQuality.h"
  #include "security/SecurityEventCounters.h"
  #ifdef SERIAL_PORT_USBVIRTUAL
  #define Serial SERIAL_PORT_USBVIRTUAL
  #endif
  #include <heltec_unofficial.h>
 // #include "wifi.h"
- #include "image.h"
+ #include "../common/BrandingLogo.h"
  #include "Lang.h"
  #include <NimBLEDevice.h>
+
+// Hardware-specific implementation of the shared IDuckDisplay interface
+// (see common/DuckDisplayAdapter.h) wrapping the SSD1306Wire `display`
+// object heltec_unofficial.h declares globally. Only used by the 6 screen
+// functions that are duplicated between boards (displayHome/displayID/
+// displayBatt/displayMessage/displayAnnouncement/showHoldProgress) and the
+// boot splash -- every other direct `display.*()` call elsewhere in this
+// file is untouched.
+class HeltecDisplayAdapter : public IDuckDisplay {
+public:
+  void begin() override {
+    display.clear();
+  }
+  void end() override {
+    display.display();
+  }
+  void drawStr(int x, int yTop, const char *s) override {
+    display.setFont(ArialMT_Plain_10);
+    display.setTextAlignment(TEXT_ALIGN_LEFT);
+    display.drawString(x, yTop, s);
+  }
+  void drawStrCenter(int yTop, const char *s) override {
+    display.setFont(ArialMT_Plain_10);
+    display.setTextAlignment(TEXT_ALIGN_CENTER);
+    display.drawString(64, yTop, s);
+  }
+  void drawStrRight(int yTop, const char *s) override {
+    display.setFont(ArialMT_Plain_10);
+    display.setTextAlignment(TEXT_ALIGN_RIGHT);
+    display.drawString(128, yTop, s);
+  }
+  void drawStrMaxWidth(int x, int yTop, int maxWidth, const char *s) override {
+    display.setFont(ArialMT_Plain_10);
+    display.setTextAlignment(TEXT_ALIGN_LEFT);
+    display.drawStringMaxWidth(x, yTop, maxWidth, s);
+  }
+  void drawXBM(int x, int y, int w, int h, const uint8_t *bits) override {
+    display.drawXbm(x, y, w, h, bits);
+  }
+  void drawProgressBar(int x, int y, int w, int h, uint8_t pct) override {
+    display.drawProgressBar(x, y, w, h, pct);
+  }
+  void powerSave(bool on) override {
+    if (on) display.displayOff(); else display.displayOn();
+  }
+};
+static HeltecDisplayAdapter gDisplay;
 
 // Access the RadioLib radio instance from DuckLoRa.cpp to read RSSI/SNR.
 // getSignalScore() is protected in Duck, so we reach the object directly.
@@ -360,11 +412,11 @@ class TxCallbacks : public NimBLECharacteristicCallbacks {
   esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
 
   // Display already initialised at top of setup(); just show the splash.
-  display.clear();
   display.flipScreenVertically();
 
-  display.drawXbm(20, 0, taqisystems_small_width, taqisystems_small_height, taqisystems_small_bits);
-  display.display();
+  gDisplay.begin();
+  gDisplay.drawXBM(20, 0, taqisystems_small_width, taqisystems_small_height, taqisystems_small_bits);
+  gDisplay.end();
   heltec_delay(10000);
   display.clear();
 
@@ -406,7 +458,7 @@ class TxCallbacks : public NimBLECharacteristicCallbacks {
     display.clear();
     display.setFont(ArialMT_Plain_10);
     display.setTextAlignment(TEXT_ALIGN_LEFT);
-    display.drawString(0, 0, "Batt: " + String(heltec_battery_percent(readVbat())) + "%");
+    display.drawString(0, 0, TXT_BATT_LABEL + String(heltec_battery_percent(readVbat())) + "%");
     display.setTextAlignment(TEXT_ALIGN_RIGHT);
     display.drawString(128, 0, buffer);
     if (phoneGpsNoFix) {
@@ -971,10 +1023,7 @@ class TxCallbacks : public NimBLECharacteristicCallbacks {
   // Run AFTER duck.run() so serviceInterruptFlags() has already processed the
   // stale TX_DONE from the relay — otherwise goToReceiveMode() would call
   // startReceive() and abort the GPS response startTransmit().
-  if (gpsTxPending) {
-    gpsTxPending = false;
-    int result = sendUplink(topics::gps, std::string(reinterpret_cast<const char*>(gpsTxPayload.data()), gpsTxPayload.size()));
-    gpsLoraOk = (result == 0);
+  if (flushDeferredGpsTx(gpsTxPending, gpsTxPayload, &gpsLoraOk)) {
     Serial.printf("[GPS] Deferred LoRa TX %s (%u bytes)\n", gpsLoraOk ? "OK" : "FAILED",
                   (unsigned)gpsTxPayload.size());
   }
@@ -983,13 +1032,8 @@ class TxCallbacks : public NimBLECharacteristicCallbacks {
   // Two-stage defer: when beaconAckPending is set, arm a 350 ms deadline
   // so the relay TX started by forwardPacket() inside handleReceivedPacket
   // (~160 ms on air) has time to complete before we start a new TX.
-  if (beaconAckPending && beaconAckDeferMs == 0) {
-    beaconAckDeferMs = millis() + 350;
-    Serial.println("[BEACON] ACK TX armed (350 ms relay-clear delay)");
-  }
-  if (beaconAckDeferMs > 0 && millis() >= beaconAckDeferMs && !gpsTxPending) {
-    beaconAckDeferMs = 0;
-    beaconAckPending = false;
+  armBeaconAckIfPending(beaconAckPending, beaconAckDeferMs);
+  if (beaconAckReadyToSend(beaconAckDeferMs, beaconAckPending, gpsTxPending)) {
     std::string beaconAckWire = meshgroupconfig::isConfigured()
         ? encryptBeaconPayload(TOPIC_BEACON_ACK, beaconAckPayload)
         : std::string(beaconAckPayload);
@@ -1018,17 +1062,10 @@ class TxCallbacks : public NimBLECharacteristicCallbacks {
     } else if (phoneGpsLatBuf[0] != '\0' && !gpsTxPending) {
       // GPS already cached from a previous GPSREQ — respond immediately
       // without a new round-trip to the phone so OpenDMS always gets an answer.
-      duckcdp_GpsReading reading = duckcdp_GpsReading_init_zero;
-      reading.has_fix = true;
-      reading.source = duckcdp_GpsSource_GPS_SOURCE_PHONE;
-      reading.no_fix_reason = duckcdp_GpsNoFixReason_GPS_REASON_NONE;
-      reading.lat_e7 = (int32_t)lround(atof(phoneGpsLatBuf) * 1e7);
-      reading.lng_e7 = (int32_t)lround(atof(phoneGpsLngBuf) * 1e7);
-      if (phoneGpsAltBuf[0] != '\0') reading.alt_m = (int32_t)lround(atof(phoneGpsAltBuf));
-      if (phoneGpsSpdBuf[0] != '\0') reading.spd_dkmh = (uint32_t)lround(atof(phoneGpsSpdBuf) * 10);
-      if (phoneGpsHdgBuf[0] != '\0') reading.hdg_deg = (uint32_t)lround(atof(phoneGpsHdgBuf));
-      reading.batt_pct = heltec_battery_percent(readVbat());
-      reading.rssi_dbm = currentRssiDbm();
+      duckcdp_GpsReading reading = buildGpsReadingFix(duckcdp_GpsSource_GPS_SOURCE_PHONE,
+          String(phoneGpsLatBuf), String(phoneGpsLngBuf), String(phoneGpsAltBuf),
+          String(phoneGpsSpdBuf), String(phoneGpsHdgBuf),
+          heltec_battery_percent(readVbat()), currentRssiDbm());
       gpsTxPayload = duckpayload::encodeGps(reading);
       gpsTxPending = true;
       Serial.printf("[GPS] Deferred GPS TX from cache: lat=%s lng=%s\n", phoneGpsLatBuf, phoneGpsLngBuf);
@@ -1042,12 +1079,9 @@ class TxCallbacks : public NimBLECharacteristicCallbacks {
   // no-fix to the mesh so OpenDMS gets an answer instead of silence.
   if (gpsReqSentMs > 0 && !gpsTxPending && millis() - gpsReqSentMs > 10000UL) {
     gpsReqSentMs = 0;
-    duckcdp_GpsReading noGps = duckcdp_GpsReading_init_zero;
-    noGps.has_fix = false;
-    noGps.source = duckcdp_GpsSource_GPS_SOURCE_NONE;
-    noGps.no_fix_reason = duckcdp_GpsNoFixReason_GPS_REASON_NO_RESPONSE;
-    noGps.batt_pct = heltec_battery_percent(readVbat());
-    noGps.rssi_dbm = currentRssiDbm();
+    duckcdp_GpsReading noGps = buildGpsReadingNoFix(duckcdp_GpsSource_GPS_SOURCE_NONE,
+        duckcdp_GpsNoFixReason_GPS_REASON_NO_RESPONSE,
+        heltec_battery_percent(readVbat()), currentRssiDbm());
     std::vector<uint8_t> encoded = duckpayload::encodeGps(noGps);
     sendUplink(topics::gps, std::string(reinterpret_cast<const char*>(encoded.data()), encoded.size()));
     Serial.println("[GPS] GPSREQ timeout — no response from phone, sent no-fix report.");
@@ -1271,9 +1305,7 @@ class TxCallbacks : public NimBLECharacteristicCallbacks {
             emergencyDisplayPending = true;   // operator message — stay until button pressed
             displayEnabled = true;
             {
-              duckcdp_OpText ack = duckcdp_OpText_init_zero;
-              String ackText = "MSG_READ:TEXT:" + message;
-              std::snprintf(ack.text, sizeof(ack.text), "%s", ackText.c_str());
+              duckcdp_OpText ack = buildOpText("MSG_READ:TEXT:" + message);
               std::vector<uint8_t> encoded = duckpayload::encodeOpText(ack);
               sendUplink(22, std::string(reinterpret_cast<const char*>(encoded.data()), encoded.size()));
             }
@@ -1303,8 +1335,7 @@ class TxCallbacks : public NimBLECharacteristicCallbacks {
             flashLED();
             broadcast(String("CDK:MSG,TEXT:") + message);
             {
-              duckcdp_OpText ack = duckcdp_OpText_init_zero;
-              std::snprintf(ack.text, sizeof(ack.text), "%s", "ALERT_ACK");
+              duckcdp_OpText ack = buildOpText("ALERT_ACK");
               std::vector<uint8_t> encoded = duckpayload::encodeOpText(ack);
               sendUplink(23, std::string(reinterpret_cast<const char*>(encoded.data()), encoded.size()));
             }
@@ -1393,7 +1424,7 @@ class TxCallbacks : public NimBLECharacteristicCallbacks {
               display.clear();
               display.setFont(ArialMT_Plain_10);
               display.setTextAlignment(TEXT_ALIGN_LEFT);
-              display.drawString(0, 0, "Batt: " + String(heltec_battery_percent(readVbat())) + "%");
+              display.drawString(0, 0, TXT_BATT_LABEL + String(heltec_battery_percent(readVbat())) + "%");
               display.setTextAlignment(TEXT_ALIGN_RIGHT);
               display.drawString(128, 0, buffer);
               display.setTextAlignment(TEXT_ALIGN_LEFT);
@@ -1417,7 +1448,7 @@ class TxCallbacks : public NimBLECharacteristicCallbacks {
               display.clear();
               display.setFont(ArialMT_Plain_10);
               display.setTextAlignment(TEXT_ALIGN_LEFT);
-              display.drawString(0, 0, "Batt: " + String(heltec_battery_percent(readVbat())) + "%");
+              display.drawString(0, 0, TXT_BATT_LABEL + String(heltec_battery_percent(readVbat())) + "%");
               display.setTextAlignment(TEXT_ALIGN_RIGHT);
               display.drawString(128, 0, buffer);
               display.setTextAlignment(TEXT_ALIGN_CENTER);
@@ -1459,7 +1490,7 @@ class TxCallbacks : public NimBLECharacteristicCallbacks {
               display.clear();
               display.setFont(ArialMT_Plain_10);
               display.setTextAlignment(TEXT_ALIGN_LEFT);
-              display.drawString(0, 0, "Batt: " + String(heltec_battery_percent(readVbat())) + "%");
+              display.drawString(0, 0, TXT_BATT_LABEL + String(heltec_battery_percent(readVbat())) + "%");
               display.setTextAlignment(TEXT_ALIGN_RIGHT);
               display.drawString(128, 0, buffer);
               display.setTextAlignment(TEXT_ALIGN_CENTER);
@@ -1601,9 +1632,7 @@ class TxCallbacks : public NimBLECharacteristicCallbacks {
                 if (mid.length() > 0) {
                   std::array<uint8_t, 8> senderDuid;
                   for (int i = 0; i < 8; i++) senderDuid[i] = packet.sduid[i];
-                  duckcdp_MTalk ack = duckcdp_MTalk_init_zero;
-                  ack.kind = duckcdp_MTalkKind_MTALK_ACK;
-                  std::snprintf(ack.mid, sizeof(ack.mid), "%s", mid.c_str());
+                  duckcdp_MTalk ack = buildMTalk(duckcdp_MTalkKind_MTALK_ACK, mid, "");
                   std::vector<uint8_t> encoded = duckpayload::encodeMTalk(ack);
                   if (!encoded.empty()) {
                     sendMamaLink(std::string(reinterpret_cast<const char*>(encoded.data()), encoded.size()), senderDuid);
@@ -1655,39 +1684,17 @@ class TxCallbacks : public NimBLECharacteristicCallbacks {
     msg.toUpperCase();
     displayID();
     displayBatt();
-    display.setFont(ArialMT_Plain_10);
-    display.setTextAlignment(TEXT_ALIGN_LEFT);
-    //display.println("Message:");
-    display.drawStringMaxWidth(0, 10, 128, msg);
-    //display.println(msg);
-    display.display();
+    gDisplay.drawStrMaxWidth(0, 10, 128, msg.c_str());
+    gDisplay.end();
  }
 
  void displayHome() {
-    display.clear();
-    display.setFont(ArialMT_Plain_10);
-    // Row 1 (y=0): BATT left, ID right
-    display.setTextAlignment(TEXT_ALIGN_LEFT);
-    display.drawString(0, 0, "BATT:" + String(heltec_battery_percent(readVbat())) + "%");
-    display.setTextAlignment(TEXT_ALIGN_RIGHT);
-    display.drawString(128, 0, buffer);
+    gDisplay.begin();
+    gDisplay.drawStr(0, 0, (TXT_BATT_LABEL + String(heltec_battery_percent(readVbat())) + "%").c_str());
+    gDisplay.drawStrRight(0, buffer);
     // Row 2 (y=12): signal quality or TX status
-    display.setTextAlignment(TEXT_ALIGN_CENTER);
-    String sigStr;
-    if (lastSignalPct >= 0) {
-      // Received-packet signal quality (most accurate)
-      if      (lastSignalPct <= 25) sigStr = TXT_SIG_WEAK   + String(lastSignalPct) + "%)";
-      else if (lastSignalPct <= 50) sigStr = TXT_SIG_OK   + String(lastSignalPct) + "%)";
-      else if (lastSignalPct <= 75) sigStr = TXT_SIG_STRONG    + String(lastSignalPct) + "%)";
-      else                          sigStr = TXT_SIG_VSTRONG + String(lastSignalPct) + "%)";
-    } else if (lastTxResult == 0) {
-      sigStr = TXT_SEND_OK;
-    } else if (lastTxResult > 0) {
-      sigStr = TXT_SEND_FAIL;
-    } else {
-      sigStr = TXT_SIG_NONE;
-    }
-    display.drawString(64, 12, sigStr);
+    String sigStr = signalQualityLabel(lastSignalPct, lastTxResult);
+    gDisplay.drawStrCenter(12, sigStr.c_str());
 
     // Row 3 (y=24): GPS status -- mirrors WioTrackerL1's home-screen layout.
     // V4 boards have a real L76K GPS module wired up (see the
@@ -1700,30 +1707,28 @@ class TxCallbacks : public NimBLECharacteristicCallbacks {
     if (!gpsModuleDetected) {
       strncpy(gpsLine, TXT_GPS_NO_MODULE, sizeof(gpsLine));
     } else if (tinyGps.location.isValid() && tinyGps.location.age() < 5000) {
-      snprintf(gpsLine, sizeof(gpsLine), "GPS: FIX %uSAT",
+      snprintf(gpsLine, sizeof(gpsLine), TXT_GPS_FIX_FMT,
                 (unsigned)(tinyGps.satellites.isValid() ? tinyGps.satellites.value() : 0));
     } else {
       snprintf(gpsLine, sizeof(gpsLine), TXT_GPS_SEARCH_FMT,
                 (unsigned)(tinyGps.satellites.isValid() ? tinyGps.satellites.value() : 0));
     }
-    display.drawString(64, 24, gpsLine);
+    gDisplay.drawStrCenter(24, gpsLine);
 #else
-    display.drawString(64, 24, TXT_GPS_NO_MODULE);
+    gDisplay.drawStrCenter(24, TXT_GPS_NO_MODULE);
 #endif
 
     // Rows 4-5 (y=36/48): hold-for-SOS hint split across two short lines
     // (was one 3-line block) to leave room for the GPS line above.
-    display.drawString(64, 36, TXT_PRESS_BUTTON_ABOVE);
-    display.drawString(64, 48, TXT_2SEC_EMERGENCY);
-    display.display();
+    gDisplay.drawStrCenter(36, TXT_PRESS_BUTTON_ABOVE);
+    gDisplay.drawStrCenter(48, TXT_2SEC_EMERGENCY);
+    gDisplay.end();
  }
 
  void displayID() {
-    display.clear();
-    display.setTextAlignment(TEXT_ALIGN_RIGHT);
-    display.setFont(ArialMT_Plain_10);
-    display.drawString(128, 0, buffer);
-    display.display();
+    gDisplay.begin();
+    gDisplay.drawStrRight(0, buffer);
+    gDisplay.end();
  }
 
 /**
@@ -1767,10 +1772,8 @@ void sendBattery() {
 
 void displayBatt() {
   int pct = heltec_battery_percent(readVbat());
-  display.setTextAlignment(TEXT_ALIGN_LEFT);
-  display.setFont(ArialMT_Plain_10);
-  display.drawString(0, 0, "Batt: " + String(pct) + "%");
-  display.display();
+  gDisplay.drawStr(0, 0, (TXT_BATT_LABEL + String(pct) + "%").c_str());
+  gDisplay.end();
 }
 
  void flashLED() {
@@ -1797,12 +1800,10 @@ void displayBatt() {
  // WioTracker's hand-rolled u8g2 drawFrame/drawBox bar.
  void showHoldProgress(uint32_t heldMs) {
    uint8_t pct = (uint8_t)constrain((heldMs * 100UL) / SOS_HOLD_MS, 0UL, 100UL);
-   display.clear();
-   display.setTextAlignment(TEXT_ALIGN_CENTER);
-   display.setFont(ArialMT_Plain_10);
-   display.drawString(64, 8, TXT_HOLD_FOR_SOS);
-   display.drawProgressBar(4, 28, 120, 12, pct);
-   display.display();
+   gDisplay.begin();
+   gDisplay.drawStrCenter(8, TXT_HOLD_FOR_SOS);
+   gDisplay.drawProgressBar(4, 28, 120, 12, pct);
+   gDisplay.end();
  }
 
  bool sendEmergency(String lat, String lng, String alt, String spd, String hdg, bool gpsFromPhone) {
@@ -1813,22 +1814,9 @@ void displayBatt() {
    // Protobuf-encode the alert (see duck_payloads.proto: SosAlert) —
    // DeviceID is carried in the MQTT envelope by the gateway so we don't
    // need to repeat it in the payload bytes.
-   duckcdp_SosAlert alertMsg = duckcdp_SosAlert_init_zero;
-   alertMsg.origin = duckcdp_SosOrigin_SOS_ORIGIN_DEVICE;
-   alertMsg.has_gps = hasGps;
-   if (hasGps) {
-     alertMsg.gps_source = gpsFromPhone ? duckcdp_GpsSource_GPS_SOURCE_PHONE
-                                         : duckcdp_GpsSource_GPS_SOURCE_DEVICE;
-     alertMsg.lat_e7 = (int32_t)lround(atof(lat.c_str()) * 1e7);
-     alertMsg.lng_e7 = (int32_t)lround(atof(lng.c_str()) * 1e7);
-     if (alt.length() > 0) alertMsg.alt_m = (int32_t)lround(atof(alt.c_str()));
-     if (spd.length() > 0) alertMsg.spd_dkmh = (uint32_t)lround(atof(spd.c_str()) * 10);
-     if (hdg.length() > 0) alertMsg.hdg_deg = (uint32_t)lround(atof(hdg.c_str()));
-   } else {
-     alertMsg.gps_source = duckcdp_GpsSource_GPS_SOURCE_NONE;
-   }
-   alertMsg.batt_pct = battPct;
-   alertMsg.rssi_dbm = currentRssiDbm();
+   duckcdp_SosAlert alertMsg = buildSosAlert(duckcdp_SosOrigin_SOS_ORIGIN_DEVICE,
+       gpsFromPhone ? duckcdp_GpsSource_GPS_SOURCE_PHONE : duckcdp_GpsSource_GPS_SOURCE_DEVICE,
+       lat, lng, alt, spd, hdg, battPct, currentRssiDbm());
    std::vector<uint8_t> encoded = duckpayload::encodeSos(alertMsg);
    Serial.printf("[MAMA] sendEmergency data: %u bytes (hasGps=%d)\n", (unsigned)encoded.size(), hasGps);
 
@@ -1935,15 +1923,12 @@ void broadcast(const String& frame) {
 void displayAnnouncement(const String& msg) {
     String upper = msg;
     upper.toUpperCase();
-    display.displayOn();
+    gDisplay.powerSave(false);
     displayID();
     displayBatt();
-    display.setFont(ArialMT_Plain_10);
-    display.setTextAlignment(TEXT_ALIGN_CENTER);
-    display.drawString(64, 12, "[EMERGENCY MESSAGE]");
-    display.setTextAlignment(TEXT_ALIGN_LEFT);
-    display.drawStringMaxWidth(0, 26, 128, upper);
-    display.display();
+    gDisplay.drawStrCenter(12, TXT_EMERGENCY_MESSAGE_HEADER);
+    gDisplay.drawStrMaxWidth(0, 26, 128, upper.c_str());
+    gDisplay.end();
     emergencyDisplayPending = true;  // hold until program button pressed
     displayEnabled = true;
 }
@@ -2063,22 +2048,11 @@ void handleSOS(const String& body) {
   display.drawString(64, 22, TXT_SENDING_SOS_2L);
   display.display();
   // construct the message — include phone telemetry + device battery
-  duckcdp_SosAlert alertMsg = duckcdp_SosAlert_init_zero;
-  alertMsg.origin = duckcdp_SosOrigin_SOS_ORIGIN_PHONE;
-  bool hasGps = (lat.length() > 0 && lng.length() > 0);
-  alertMsg.has_gps = hasGps;
-  if (hasGps) {
-    alertMsg.gps_source = duckcdp_GpsSource_GPS_SOURCE_PHONE;
-    alertMsg.lat_e7 = (int32_t)lround(atof(lat.c_str()) * 1e7);
-    alertMsg.lng_e7 = (int32_t)lround(atof(lng.c_str()) * 1e7);
-    if (alt.length() > 0) alertMsg.alt_m = (int32_t)lround(atof(alt.c_str()));
-    if (spd.length() > 0) alertMsg.spd_dkmh = (uint32_t)lround(atof(spd.c_str()) * 10);
-    if (hdg.length() > 0) alertMsg.hdg_deg = (uint32_t)lround(atof(hdg.c_str()));
-  } else {
-    alertMsg.gps_source = duckcdp_GpsSource_GPS_SOURCE_NONE;
-  }
-  alertMsg.batt_pct = battPct;
-  alertMsg.rssi_dbm = currentRssiDbm();
+  duckcdp_SosAlert alertMsg = buildSosAlert(duckcdp_SosOrigin_SOS_ORIGIN_PHONE,
+                                             duckcdp_GpsSource_GPS_SOURCE_PHONE,
+                                             lat, lng, alt, spd, hdg,
+                                             battPct, currentRssiDbm());
+  bool hasGps = alertMsg.has_gps;
   std::vector<uint8_t> encoded = duckpayload::encodeStatusReportSos(alertMsg);
   // Routed through sendUplinkSos() (not a direct duck.sendData()) so a
   // phone-triggered SOS -- which carries GPS just like sendEmergency()'s
@@ -2125,16 +2099,7 @@ void handleMsg(const String& body) {
 
   // Protobuf-encode the message (see duck_payloads.proto: StatusMsg,
   // wrapped in a StatusReport on the `status` topic).
-  duckcdp_StatusMsg statusMsg = duckcdp_StatusMsg_init_zero;
-  statusMsg.src = duckcdp_StatusMsgSrc_STATUS_MSG_SRC_PHONE;
-  std::snprintf(statusMsg.urgency, sizeof(statusMsg.urgency), "%s", urgency.c_str());
-  bool hasGps = (lat.length() > 0 && lng.length() > 0);
-  statusMsg.has_gps = hasGps;
-  if (hasGps) {
-    statusMsg.lat_e7 = (int32_t)lround(atof(lat.c_str()) * 1e7);
-    statusMsg.lng_e7 = (int32_t)lround(atof(lng.c_str()) * 1e7);
-  }
-  std::snprintf(statusMsg.text, sizeof(statusMsg.text), "%s", text.c_str());
+  duckcdp_StatusMsg statusMsg = buildStatusMsg(urgency, lat, lng, text);
 
   // show send message status
   // Display status
@@ -2172,10 +2137,7 @@ bool sendMamaTalk(const String& targetId, const String& msg, const String& mid) 
   // Protobuf-encode the chat message (see duck_payloads.proto: MTalk). The
   // receiver echoes `mid` back as a targeted delivery receipt (MTALK_ACK on
   // topic 26) when one is present.
-  duckcdp_MTalk mtalk = duckcdp_MTalk_init_zero;
-  mtalk.kind = duckcdp_MTalkKind_MTALK_MSG;
-  std::snprintf(mtalk.mid, sizeof(mtalk.mid), "%s", mid.c_str());
-  std::snprintf(mtalk.text, sizeof(mtalk.text), "%s", msg.c_str());
+  duckcdp_MTalk mtalk = buildMTalk(duckcdp_MTalkKind_MTALK_MSG, mid, msg);
   std::vector<uint8_t> encoded = duckpayload::encodeMTalk(mtalk);
   if (encoded.empty()) {
     Serial.println("[MTALK] ERROR: failed to encode MTalk message (too long?).");
@@ -2208,57 +2170,21 @@ void handleMamaTalk(const String& body) {
 void handleGps(const String& body) {
   gpsReqSentMs = 0;  // phone responded — cancel the no-response fallback
   Serial.println("[GPS] Received GPS frame from phone: " + body);
-  String lat = extractField(body, "LAT");
-  String lng = extractField(body, "LNG");
-  if (lat.length() == 0 || lat == "none" || lng.length() == 0 || lng == "none") {
-    phoneGpsNoFix = true;
-    phoneGpsDisplayPending = true;  // render from main loop (I2C not thread-safe)
-    // Defer duck.sendData() to after duck.run() to avoid TX abort race:
-    // the stale TX_DONE interrupt from the relay would call startReceive()
-    // and abort a GPS response startTransmit() that ran before duck.run().
-    duckcdp_GpsReading noFix = duckcdp_GpsReading_init_zero;
-    noFix.has_fix = false;
-    noFix.source = duckcdp_GpsSource_GPS_SOURCE_PHONE;
-    noFix.no_fix_reason = duckcdp_GpsNoFixReason_GPS_REASON_NO_SIGNAL;
-    noFix.batt_pct = heltec_battery_percent(readVbat());
-    gpsTxPayload = duckpayload::encodeGps(noFix);
-    gpsTxPending = true;
-    return;
-  }
-  duckcdp_GpsReading reading = duckcdp_GpsReading_init_zero;
-  reading.has_fix = true;
-  reading.source = duckcdp_GpsSource_GPS_SOURCE_PHONE;
-  reading.no_fix_reason = duckcdp_GpsNoFixReason_GPS_REASON_NONE;
-  reading.lat_e7 = (int32_t)lround(atof(lat.c_str()) * 1e7);
-  reading.lng_e7 = (int32_t)lround(atof(lng.c_str()) * 1e7);
-  strncpy(phoneGpsLatBuf, lat.c_str(), sizeof(phoneGpsLatBuf) - 1);
-  strncpy(phoneGpsLngBuf, lng.c_str(), sizeof(phoneGpsLngBuf) - 1);
-  // Cache optional telemetry for use by hardware SOS button fallback
-  String alt = extractField(body, "ALT");
-  String spd = extractField(body, "SPD");
-  String hdg = extractField(body, "HDG");
-  phoneGpsAltBuf[0] = '\0';
-  phoneGpsSpdBuf[0] = '\0';
-  phoneGpsHdgBuf[0] = '\0';
-  if (alt.length() > 0) {
-    strncpy(phoneGpsAltBuf, alt.c_str(), sizeof(phoneGpsAltBuf) - 1);
-    reading.alt_m = (int32_t)lround(atof(alt.c_str()));
-  }
-  if (spd.length() > 0) {
-    strncpy(phoneGpsSpdBuf, spd.c_str(), sizeof(phoneGpsSpdBuf) - 1);
-    reading.spd_dkmh = (uint32_t)lround(atof(spd.c_str()) * 10);
-  }
-  if (hdg.length() > 0) {
-    strncpy(phoneGpsHdgBuf, hdg.c_str(), sizeof(phoneGpsHdgBuf) - 1);
-    reading.hdg_deg = (uint32_t)lround(atof(hdg.c_str()));
-  }
-  reading.batt_pct = heltec_battery_percent(readVbat());
-  phoneGpsNoFix = false;
+  // Defer duck.sendData() to after duck.run() to avoid TX abort race:
+  // the stale TX_DONE interrupt from the relay would call startReceive()
+  // and abort a GPS response startTransmit() that ran before duck.run().
+  PhoneGpsParseResult result = parsePhoneGpsFrame(body,
+      phoneGpsLatBuf, sizeof(phoneGpsLatBuf), phoneGpsLngBuf, sizeof(phoneGpsLngBuf),
+      phoneGpsAltBuf, sizeof(phoneGpsAltBuf), phoneGpsSpdBuf, sizeof(phoneGpsSpdBuf),
+      phoneGpsHdgBuf, sizeof(phoneGpsHdgBuf),
+      heltec_battery_percent(readVbat()), 0);
+  phoneGpsNoFix = !result.hasFix;
   phoneGpsDisplayPending = true;  // render from main loop (I2C not thread-safe)
-  // Defer duck.sendData() to after duck.run() — see comment above.
-  gpsTxPayload = duckpayload::encodeGps(reading);
+  gpsTxPayload = duckpayload::encodeGps(result.reading);
   gpsTxPending = true;
-  Serial.printf("[GPS] GPS TX deferred: lat=%s lng=%s\n", lat.c_str(), lng.c_str());
+  if (result.hasFix) {
+    Serial.printf("[GPS] GPS TX deferred: lat=%s lng=%s\n", phoneGpsLatBuf, phoneGpsLngBuf);
+  }
 }
 
 // Handles CDK:RADIOREGION frames from the app (mobile-app settings screen):
