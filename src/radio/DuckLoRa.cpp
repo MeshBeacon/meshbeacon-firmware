@@ -5,6 +5,12 @@
 #define DUCK_RADIO_IRQ_RX_DONE RADIOLIB_SX126X_IRQ_RX_DONE
 #define DUCK_RADIO_IRQ_CRC_ERROR RADIOLIB_SX126X_IRQ_CRC_ERR
 #define DUCK_RADIO_IRQ_HEADER_ERR RADIOLIB_SX126X_IRQ_HEADER_ERR
+#elif defined(CDPCFG_RADIO_LR1110)
+#define DUCK_RADIO_IRQ_TIMEOUT RADIOLIB_LR11X0_IRQ_TIMEOUT
+#define DUCK_RADIO_IRQ_TX_DONE RADIOLIB_LR11X0_IRQ_TX_DONE
+#define DUCK_RADIO_IRQ_RX_DONE RADIOLIB_LR11X0_IRQ_RX_DONE
+#define DUCK_RADIO_IRQ_CRC_ERROR RADIOLIB_LR11X0_IRQ_CRC_ERR
+#define DUCK_RADIO_IRQ_HEADER_ERR RADIOLIB_LR11X0_IRQ_HEADER_ERR
 #else
 #define DUCK_RADIO_IRQ_TIMEOUT RADIOLIB_SX127X_CLEAR_IRQ_FLAG_RX_TIMEOUT
 #define DUCK_RADIO_IRQ_TX_DONE RADIOLIB_SX127X_CLEAR_IRQ_FLAG_TX_DONE
@@ -12,7 +18,7 @@
 #define DUCK_RADIO_IRQ_CRC_ERROR RADIOLIB_SX127X_CLEAR_IRQ_FLAG_PAYLOAD_CRC_ERROR
 #endif
 
-#if defined(CDPCFG_RADIO_SX1262)
+#if defined(CDPCFG_RADIO_SX1262) || defined(CDPCFG_RADIO_LR1110)
 CDPCFG_LORA_CLASS lora =
         new Module(CDPCFG_PIN_LORA_CS, CDPCFG_PIN_LORA_DIO1, CDPCFG_PIN_LORA_RST,
                    CDPCFG_PIN_LORA_BUSY);
@@ -95,6 +101,13 @@ int DuckLoRa::setupRadio(const LoRaConfigParams &config) {
     // Board uses DIO2 to drive the RF switch (common on SX1262 modules).
     lora.setDio2AsRfSwitch(true);
 #endif
+#ifdef CDPCFG_LORA_RFSWITCH_TABLE
+    // Board uses dedicated GPIO lines (DIO5-8) to drive an external RF/GNSS
+    // switch matrix (LR1110 modules) -- table defined in the board's own
+    // rfswitch.h under boards/<variant>/, found via board_build.variants_dir.
+    #include "rfswitch.h"
+    lora.setRfSwitchTable(rfswitch_dio_pins, rfswitch_table);
+#endif
     rc = lora.setFrequency(config.band);
     if (rc == RADIOLIB_ERR_INVALID_FREQUENCY) {
         logerr_ln("ERROR  frequency is invalid");
@@ -118,9 +131,13 @@ int DuckLoRa::setupRadio(const LoRaConfigParams &config) {
         logerr_ln("ERROR  output power is invalid");
         return DUCKLORA_ERR_SETUP;
     }
-#ifdef CDPCFG_RADIO_SX1262
+#if defined(CDPCFG_RADIO_SX1262)
     // set the interrupt handler to execute when packet tx or rx is done.
     lora.setDio1Action(config.func);
+#elif defined(CDPCFG_RADIO_LR1110)
+    // LR11x0 family exposes a single generic IRQ pin action setter (no
+    // separate DIO0/DIO1 split like SX126x/SX127x).
+    lora.setIrqAction(config.func);
 #else
     rc = lora.setGain(CDPCFG_RF_LORA_GAIN);
     if (rc == RADIOLIB_ERR_INVALID_GAIN) {
@@ -199,7 +216,7 @@ std::optional<std::vector<uint8_t>> DuckLoRa::readReceivedData() { //return a st
 
     // Log signal quality for every received packet (before CRC check so
     // corrupted packets also show RSSI/SNR for diagnostics).
-    #ifndef CDPCFG_RADIO_SX1262
+    #if !defined(CDPCFG_RADIO_SX1262) && !defined(CDPCFG_RADIO_LR1110)
         loginfo_ln("RX: rssi: %f snr: %f fe: %d size: %d", lora.getRSSI(), lora.getSNR(), lora.getFrequencyError(true), packet_length);
     #else
         loginfo_ln("RX: rssi: %f snr: %f size: %d", lora.getRSSI(), lora.getSNR(), packet_length);
@@ -378,6 +395,33 @@ void DuckLoRa::serviceInterruptFlags() {
         }
         if (DuckLoRa::interruptFlags & RADIOLIB_SX126X_IRQ_TIMEOUT ) {
             loginfo_ln("SX1262 Interrupt flag was set: timeout");
+            goToReceiveMode(false);
+        }
+#elif defined(CDPCFG_RADIO_LR1110)
+        // LR1110 flags
+        if (DuckLoRa::interruptFlags & RADIOLIB_LR11X0_IRQ_CRC_ERR ) {
+            loginfo_ln("LR1110 Interrupt flag was set: payload CRC error");
+            goToReceiveMode(false);
+            lora.standby();
+        }
+        if (DuckLoRa::interruptFlags & RADIOLIB_LR11X0_IRQ_HEADER_ERR ) {
+            loginfo_ln("LR1110 Interrupt flag was set: header CRC error");
+            goToReceiveMode(false);
+            lora.standby();
+        }
+        if (DuckLoRa::interruptFlags & RADIOLIB_LR11X0_IRQ_RX_DONE ) {
+            loginfo_ln("LR1110 Interrupt flag was set: packet reception complete");
+            setReceiveFlag(true);
+            lora.standby(); // we are done receiving, go to standby. We can't sleep because read buffer is not empty
+        }
+        if (DuckLoRa::interruptFlags & RADIOLIB_LR11X0_IRQ_TX_DONE ) {
+            loginfo_ln("LR1110 Interrupt flag was set: payload transmission complete");
+            lora.finishTransmit();
+            lora.setFrequency(defaultRadioParams.band); // restore mesh channel
+            goToReceiveMode(false);
+        }
+        if (DuckLoRa::interruptFlags & RADIOLIB_LR11X0_IRQ_TIMEOUT ) {
+            loginfo_ln("LR1110 Interrupt flag was set: timeout");
             goToReceiveMode(false);
         }
 #else

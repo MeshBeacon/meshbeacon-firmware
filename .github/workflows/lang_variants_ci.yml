@@ -1,4 +1,4 @@
-name: Language Variants Build (Heltec V3 / Wio Tracker L1 Pro)
+name: Language Variants Build (Heltec V3 / Wio Tracker L1 Pro / T1000-E)
 
 on:
   push:
@@ -6,6 +6,7 @@ on:
       - 'src/**'
       - 'examples/Basic-Ducks/Heltec/**'
       - 'examples/Basic-Ducks/Seeed/WioTrackerL1/**'
+      - 'examples/Basic-Ducks/Seeed/T1000E/**'
       - 'tools/**'
       - 'boards/**'
       - 'platformio.ini'
@@ -15,6 +16,7 @@ on:
       - 'src/**'
       - 'examples/Basic-Ducks/Heltec/**'
       - 'examples/Basic-Ducks/Seeed/WioTrackerL1/**'
+      - 'examples/Basic-Ducks/Seeed/T1000E/**'
       - 'tools/**'
       - 'boards/**'
       - 'platformio.ini'
@@ -43,6 +45,12 @@ jobs:
             env: local_wio_tracker_l1
             example_dir: Basic-Ducks/Seeed/WioTrackerL1
             lang_flag: '-DDUCK_LANG_EN'
+          # T1000-E has no OLED (NullDisplayAdapter / no-op dspStr()), so
+          # DUCK_LANG_EN has no observable effect there -- one build suffices.
+          - name: T1000-E
+            env: local_t1000e
+            example_dir: Basic-Ducks/Seeed/T1000E
+            lang_flag: ''
 
     steps:
       - name: Checkout code
