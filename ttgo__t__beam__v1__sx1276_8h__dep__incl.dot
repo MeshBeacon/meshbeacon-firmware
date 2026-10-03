@@ -25,16 +25,14 @@ digraph "/home/runner/work/meshbeacon-firmware/meshbeacon-firmware/src/include/b
   Node9 -> Node3 [id="edge10_Node000009_Node000003",dir="back",color="steelblue1",style="solid",tooltip=" "];
   Node9 -> Node10 [id="edge11_Node000009_Node000010",dir="back",color="steelblue1",style="solid",tooltip=" "];
   Node10 [id="Node000010",label="/home/runner/work/meshbeacon\l-firmware/meshbeacon-firmware\l/src/radio/DuckLoRa.cpp",height=0.2,width=0.4,color="grey40", fillcolor="white", style="filled",URL="$_duck_lo_ra_8cpp.html",tooltip=" "];
-  Node9 -> Node11 [id="edge12_Node000009_Node000011",dir="back",color="steelblue1",style="solid",tooltip=" "];
-  Node11 [id="Node000011",label="/home/runner/work/meshbeacon\l-firmware/meshbeacon-firmware\l/src/radio/RadioRegionConfig.cpp",height=0.2,width=0.4,color="grey40", fillcolor="white", style="filled",URL="$_radio_region_config_8cpp.html",tooltip=" "];
-  Node8 -> Node12 [id="edge13_Node000008_Node000012",dir="back",color="steelblue1",style="solid",tooltip=" "];
-  Node12 [id="Node000012",label="/home/runner/work/meshbeacon\l-firmware/meshbeacon-firmware\l/src/routing/RouteJSON.h",height=0.2,width=0.4,color="grey40", fillcolor="white", style="filled",URL="$_route_j_s_o_n_8h.html",tooltip="This file is internal to CDP and provides route JSON construction and manipulation."];
-  Node12 -> Node3 [id="edge14_Node000012_Node000003",dir="back",color="steelblue1",style="solid",tooltip=" "];
-  Node8 -> Node13 [id="edge15_Node000008_Node000013",dir="back",color="steelblue1",style="solid",tooltip=" "];
-  Node13 [id="Node000013",label="/home/runner/work/meshbeacon\l-firmware/meshbeacon-firmware\l/src/utils/DuckUtils.cpp",height=0.2,width=0.4,color="grey40", fillcolor="white", style="filled",URL="$_duck_utils_8cpp.html",tooltip=" "];
-  Node2 -> Node14 [id="edge16_Node000002_Node000014",dir="back",color="steelblue1",style="solid",tooltip=" "];
-  Node14 [id="Node000014",label="/home/runner/work/meshbeacon\l-firmware/meshbeacon-firmware\l/src/wifi/DuckWifi.h",height=0.2,width=0.4,color="grey40", fillcolor="white", style="filled",URL="$_duck_wifi_8h.html",tooltip=" "];
-  Node14 -> Node7 [id="edge17_Node000014_Node000007",dir="back",color="steelblue1",style="solid",tooltip=" "];
-  Node14 -> Node15 [id="edge18_Node000014_Node000015",dir="back",color="steelblue1",style="solid",tooltip=" "];
-  Node15 [id="Node000015",label="/home/runner/work/meshbeacon\l-firmware/meshbeacon-firmware\l/src/wifi/DuckWifi.cpp",height=0.2,width=0.4,color="grey40", fillcolor="white", style="filled",URL="$_duck_wifi_8cpp.html",tooltip=" "];
+  Node8 -> Node11 [id="edge12_Node000008_Node000011",dir="back",color="steelblue1",style="solid",tooltip=" "];
+  Node11 [id="Node000011",label="/home/runner/work/meshbeacon\l-firmware/meshbeacon-firmware\l/src/routing/RouteJSON.h",height=0.2,width=0.4,color="grey40", fillcolor="white", style="filled",URL="$_route_j_s_o_n_8h.html",tooltip="This file is internal to CDP and provides route JSON construction and manipulation."];
+  Node11 -> Node3 [id="edge13_Node000011_Node000003",dir="back",color="steelblue1",style="solid",tooltip=" "];
+  Node8 -> Node12 [id="edge14_Node000008_Node000012",dir="back",color="steelblue1",style="solid",tooltip=" "];
+  Node12 [id="Node000012",label="/home/runner/work/meshbeacon\l-firmware/meshbeacon-firmware\l/src/utils/DuckUtils.cpp",height=0.2,width=0.4,color="grey40", fillcolor="white", style="filled",URL="$_duck_utils_8cpp.html",tooltip=" "];
+  Node2 -> Node13 [id="edge15_Node000002_Node000013",dir="back",color="steelblue1",style="solid",tooltip=" "];
+  Node13 [id="Node000013",label="/home/runner/work/meshbeacon\l-firmware/meshbeacon-firmware\l/src/wifi/DuckWifi.h",height=0.2,width=0.4,color="grey40", fillcolor="white", style="filled",URL="$_duck_wifi_8h.html",tooltip=" "];
+  Node13 -> Node7 [id="edge16_Node000013_Node000007",dir="back",color="steelblue1",style="solid",tooltip=" "];
+  Node13 -> Node14 [id="edge17_Node000013_Node000014",dir="back",color="steelblue1",style="solid",tooltip=" "];
+  Node14 [id="Node000014",label="/home/runner/work/meshbeacon\l-firmware/meshbeacon-firmware\l/src/wifi/DuckWifi.cpp",height=0.2,width=0.4,color="grey40", fillcolor="white", style="filled",URL="$_duck_wifi_8cpp.html",tooltip=" "];
 }

@@ -151,10 +151,6 @@ Functions</h2></td></tr>
 <tr class="memitem:a53498bb1e1c667d10957b46309232a09"><td class="memTemplItemLeft" align="right" valign="top">std::string&#160;</td><td class="memTemplItemRight" valign="bottom"><a class="el" href="namespaceduckutils.html#a53498bb1e1c667d10957b46309232a09">arrayToHexString</a> (const std::array&lt; T, S &gt; arr)</td></tr>
 <tr class="memdesc:a53498bb1e1c667d10957b46309232a09"><td class="mdescLeft">&#160;</td><td class="mdescRight">Convert an container of contiguous data into hex for sending over http or display. May be more ergonomic than the convertToHex function.  <br /></td></tr>
 <tr class="separator:a53498bb1e1c667d10957b46309232a09"><td class="memSeparator" colspan="2">&#160;</td></tr>
-<tr class="memitem:aaafe2e310f84ca2e788288796f7939f7" id="r_aaafe2e310f84ca2e788288796f7939f7"><td class="memTemplParams" colspan="2">template&lt;typename T , size_t S&gt; </td></tr>
-<tr class="memitem:aaafe2e310f84ca2e788288796f7939f7"><td class="memTemplItemLeft" align="right" valign="top">std::array&lt; T, S &gt;&#160;</td><td class="memTemplItemRight" valign="bottom"><a class="el" href="namespaceduckutils.html#aaafe2e310f84ca2e788288796f7939f7">hexStringToArray</a> (const std::string &amp;hex)</td></tr>
-<tr class="memdesc:aaafe2e310f84ca2e788288796f7939f7"><td class="mdescLeft">&#160;</td><td class="mdescRight">Decode a hex string (as produced by arrayToHexString) back into a fixed-size byte array. Bounds-safe by construction: at most S bytes are ever written into the returned array regardless of the input string's length, unlike a raw std::copy of arbitrary string content into a fixed-size std::array. Any non-hex-digit character stops decoding early; remaining bytes are left zero-initialized.  <br /></td></tr>
-<tr class="separator:aaafe2e310f84ca2e788288796f7939f7"><td class="memSeparator" colspan="2">&#160;</td></tr>
 <tr class="memitem:a73122238e9e6161a781b25f4a74cca44" id="r_a73122238e9e6161a781b25f4a74cca44"><td class="memTemplParams" colspan="2">template&lt;typename T &gt; </td></tr>
 <tr class="memitem:a73122238e9e6161a781b25f4a74cca44"><td class="memTemplItemLeft" align="right" valign="top">bool&#160;</td><td class="memTemplItemRight" valign="bottom"><a class="el" href="namespaceduckutils.html#a73122238e9e6161a781b25f4a74cca44">isEqual</a> (const std::vector&lt; T &gt; &amp;a, const std::vector&lt; T &gt; &amp;b)</td></tr>
 <tr class="memdesc:a73122238e9e6161a781b25f4a74cca44"><td class="mdescLeft">&#160;</td><td class="mdescRight">Compare two vectors with regard to both size and contents.  <br /></td></tr>
@@ -375,35 +371,6 @@ template&lt;typename T , size_t S&gt; </div>
   </table>
   </dd>
 </dl>
-
-</div>
-</div>
-<a id="aaafe2e310f84ca2e788288796f7939f7" name="aaafe2e310f84ca2e788288796f7939f7"></a>
-<h2 class="memtitle"><span class="permalink"><a href="#aaafe2e310f84ca2e788288796f7939f7">&#9670;&#160;</a></span>hexStringToArray()</h2>
-
-<div class="memitem">
-<div class="memproto">
-<div class="memtemplate">
-template&lt;typename T , size_t S&gt; </div>
-      <table class="memname">
-        <tr>
-          <td class="memname">std::array&lt; T, S &gt; duckutils::hexStringToArray </td>
-          <td>(</td>
-          <td class="paramtype">const std::string &amp;&#160;</td>
-          <td class="paramname"><em>hex</em></td><td>)</td>
-          <td></td>
-        </tr>
-      </table>
-</div><div class="memdoc">
-
-<p>Decode a hex string (as produced by arrayToHexString) back into a fixed-size byte array. Bounds-safe by construction: at most S bytes are ever written into the returned array regardless of the input string's length, unlike a raw std::copy of arbitrary string content into a fixed-size std::array. Any non-hex-digit character stops decoding early; remaining bytes are left zero-initialized. </p>
-<dl class="params"><dt>Parameters</dt><dd>
-  <table class="params">
-    <tr><td class="paramname">hex</td><td>the hex string to decode </td></tr>
-  </table>
-  </dd>
-</dl>
-<dl class="section return"><dt>Returns</dt><dd>A std::array of bytes decoded from the hex string. </dd></dl>
 
 </div>
 </div>

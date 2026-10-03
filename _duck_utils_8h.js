@@ -8,7 +8,6 @@ var _duck_utils_8h =
     [ "getCDPVersion", "_duck_utils_8h.html#a3ee943927ff96bc0edbe3b37f2396a7b", null ],
     [ "getDetectState", "_duck_utils_8h.html#a4767620f654cbb1e876562754cffb77a", null ],
     [ "getRandomBytes", "_duck_utils_8h.html#af78c3c72848c8c50effe19cd5edc25d3", null ],
-    [ "hexStringToArray", "_duck_utils_8h.html#aaafe2e310f84ca2e788288796f7939f7", null ],
     [ "isEqual", "_duck_utils_8h.html#a97f2ca60c96157b104216f166439f78b", null ],
     [ "isEqual", "_duck_utils_8h.html#a73122238e9e6161a781b25f4a74cca44", null ],
     [ "stringToArray", "_duck_utils_8h.html#a46c1f1a9161c53d8489a80aa75a2b8a8", null ],

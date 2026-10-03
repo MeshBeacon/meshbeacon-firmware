@@ -1,4 +1,4 @@
 var searchData=
 [
-  ['peeridentities_0',['peerIdentities',['../class_duck.html#aca23657d455d96f14d20045b91874954',1,'Duck']]]
+  ['txpower_0',['txPower',['../struct_lo_ra_config_params.html#ab9d693fd47ea19448dbfc802ac17f3a1',1,'LoRaConfigParams']]]
 ];

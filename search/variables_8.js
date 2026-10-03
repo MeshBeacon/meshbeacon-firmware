@@ -1,6 +1,6 @@
 var searchData=
 [
-  ['max_5fpeer_5fidentities_0',['MAX_PEER_IDENTITIES',['../class_duck.html#a48659680e914490344970aea1c02def7',1,'Duck']]],
-  ['memory_5flow_5fthreshold_1',['MEMORY_LOW_THRESHOLD',['../class_duck.html#a697d724a7df2d9c4da74f49f99918039',1,'Duck']]],
-  ['meshchannelmhz_2',['meshChannelMHz',['../_radio_region_config_8cpp.html#a72fb874e489266670160f07942309b6b',1,'RadioRegionConfig.cpp']]]
+  ['sf_0',['sf',['../struct_lo_ra_config_params.html#a70d447c5773363258072f59bd2160ce7',1,'LoRaConfigParams']]],
+  ['signalscore_1',['signalScore',['../struct_signal_score.html#a876f8ddd8e45d28aa0d89c4c5e1da069',1,'SignalScore']]],
+  ['snr_2',['snr',['../struct_signal_score.html#a9b7c1eb8c99e3a63b56eee4c815f9188',1,'SignalScore']]]
 ];

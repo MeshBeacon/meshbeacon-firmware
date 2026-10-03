@@ -4,6 +4,5 @@ var class_mama_duck =
     [ "MamaDuck", "class_mama_duck.html#ad72d51e05bf177c1187a3b73c008eb99", null ],
     [ "~MamaDuck", "class_mama_duck.html#a1f6b35d7d6d563dae5846bf075e76e0c", null ],
     [ "getType", "class_mama_duck.html#a7b8b62f6e1567358594999c6df29a7ec", null ],
-    [ "goPublic", "class_mama_duck.html#a44806709891125d421630244e32dcf17", null ],
     [ "onReceiveDuckData", "class_mama_duck.html#aef110680be5a8b247280205885de76be", null ]
 ];

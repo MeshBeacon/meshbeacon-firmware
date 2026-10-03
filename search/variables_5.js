@@ -1,4 +1,5 @@
 var searchData=
 [
-  ['gain_0',['gain',['../struct_lo_ra_config_params.html#ad7683912520829c77f795e817a291771',1,'LoRaConfigParams']]]
+  ['lastrreqtime_0',['lastRreqTime',['../class_duck.html#a97b9b046f7ea68b31d010fa2537d6a62',1,'Duck']]],
+  ['lora_1',['lora',['../_duck_lo_ra_8cpp.html#a9bd751f428f37e0cf9d3af962ca26bb6',1,'DuckLoRa.cpp']]]
 ];

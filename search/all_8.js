@@ -1,11 +1,15 @@
 var searchData=
 [
-  ['handlereceivedpacket_0',['handleReceivedPacket',['../class_duck.html#a769be988f578dec859e38a0a6530daf2',1,'Duck']]],
-  ['header_1',['Adding the Board Header',['../md__2home_2runner_2work_2meshbeacon-firmware_2meshbeacon-firmware_2src_2include_2boards_2_r_e_a_d_m_e.html#autotoc_md4',1,'']]],
-  ['header_5faad_5flength_2',['HEADER_AAD_LENGTH',['../class_duck.html#a074dd0963fdeba307b9d86b993dc1f3d',1,'Duck']]],
-  ['heltec_5fwifi_5flora_5f32_5fv2_2eh_3',['heltec_wifi_lora_32_V2.h',['../heltec__wifi__lora__32___v2_8h.html',1,'']]],
-  ['heltec_5fwifi_5flora_5f32_5fv3_2eh_4',['heltec_wifi_lora_32_V3.h',['../heltec__wifi__lora__32___v3_8h.html',1,'']]],
-  ['hexstringtoarray_5',['hexStringToArray',['../namespaceduckutils.html#aaafe2e310f84ca2e788288796f7939f7',1,'duckutils']]],
-  ['how_20it_20works_6',['How It Works',['../index.html#autotoc_md8',1,'']]],
-  ['how_20to_20contribute_7',['How to Contribute',['../index.html#autotoc_md10',1,'']]]
+  ['info_0',['ClusterDuck Protocol Info',['../index.html',1,'']]],
+  ['insertintoroutingtable_1',['insertIntoRoutingTable',['../class_duck_router.html#ab472031dbdbb62eb349ea203f5e6c8c6',1,'DuckRouter']]],
+  ['invoke_2',['invoke',['../structtinyformat_1_1detail_1_1format_value_as_type.html#a126bc5958024c456851f08fa380d1cac',1,'tinyformat::detail::formatValueAsType::invoke()'],['../structtinyformat_1_1detail_1_1format_value_as_type_3_01_t_00_01fmt_t_00_01true_01_4.html#a7680bc0f7b6b5eee0e27c494812fb667',1,'tinyformat::detail::formatValueAsType&lt; T, fmtT, true &gt;::invoke()'],['../structtinyformat_1_1detail_1_1convert_to_int.html#a1e1c0d85c6afc3bb21d2bc9458b3feb1',1,'tinyformat::detail::convertToInt::invoke()'],['../structtinyformat_1_1detail_1_1convert_to_int_3_01_t_00_01true_01_4.html#a7d03793b995eb4428bb13349004f5fcd',1,'tinyformat::detail::convertToInt&lt; T, true &gt;::invoke()']]],
+  ['is_5fconvertible_3',['is_convertible',['../structtinyformat_1_1detail_1_1is__convertible.html',1,'tinyformat::detail']]],
+  ['is_5fwchar_4',['is_wchar',['../structtinyformat_1_1detail_1_1is__wchar.html',1,'tinyformat::detail']]],
+  ['is_5fwchar_3c_20const_20wchar_5ft_20_2a_20_3e_5',['is_wchar&lt; const wchar_t * &gt;',['../structtinyformat_1_1detail_1_1is__wchar_3_01const_01wchar__t_01_5_01_4.html',1,'tinyformat::detail']]],
+  ['is_5fwchar_3c_20const_20wchar_5ft_5bn_5d_3e_6',['is_wchar&lt; const wchar_t[n]&gt;',['../structtinyformat_1_1detail_1_1is__wchar_3_01const_01wchar__t_0fn_0e_4.html',1,'tinyformat::detail']]],
+  ['is_5fwchar_3c_20wchar_5ft_20_2a_20_3e_7',['is_wchar&lt; wchar_t * &gt;',['../structtinyformat_1_1detail_1_1is__wchar_3_01wchar__t_01_5_01_4.html',1,'tinyformat::detail']]],
+  ['is_5fwchar_3c_20wchar_5ft_5bn_5d_3e_8',['is_wchar&lt; wchar_t[n]&gt;',['../structtinyformat_1_1detail_1_1is__wchar_3_01wchar__t_0fn_0e_4.html',1,'tinyformat::detail']]],
+  ['isequal_9',['isequal',['../namespaceduckutils.html#a73122238e9e6161a781b25f4a74cca44',1,'duckutils::isEqual(const std::vector&lt; T &gt; &amp;a, const std::vector&lt; T &gt; &amp;b)'],['../namespaceduckutils.html#a97f2ca60c96157b104216f166439f78b',1,'duckutils::isEqual(const std::array&lt; T, S &gt; &amp;a, const std::array&lt; T, S &gt; &amp;b)']]],
+  ['iswificonnected_10',['isWifiConnected',['../class_papa_duck.html#af93b9bc82edcd2be322d079136df56d2',1,'PapaDuck']]],
+  ['it_20works_11',['How It Works',['../index.html#autotoc_md8',1,'']]]
 ];

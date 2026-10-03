@@ -5,8 +5,6 @@ var dir_f720216755f5a1ced203babe1ca6998b =
     [ "lilygo_sim7000g_lora.h", "lilygo__sim7000g__lora_8h.html", null ],
     [ "lilygo_t_beam_supreme_sx1262.h", "lilygo__t__beam__supreme__sx1262_8h.html", null ],
     [ "lilygo_t_beam_sx1262.h", "lilygo__t__beam__sx1262_8h.html", null ],
-    [ "seeed_t1000e.h", "seeed__t1000e_8h.html", null ],
-    [ "seeed_wio_tracker_l1.h", "seeed__wio__tracker__l1_8h.html", null ],
     [ "ttgo-t-beam.h", "ttgo-t-beam_8h.html", "ttgo-t-beam_8h" ],
     [ "ttgo_t_beam_v1_sx1276.h", "ttgo__t__beam__v1__sx1276_8h.html", null ]
 ];

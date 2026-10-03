@@ -1,4 +1,4 @@
 var searchData=
 [
-  ['id_0',['ID',['../namespaceradioregionconfig.html#ac7aec13608eabefa3b671a52136a8765ab718adec73e04ce3ec720dd11a06a308',1,'radioregionconfig']]]
+  ['link_0',['LINK',['../_duck_types_8h.html#ae840cd9270fc5804ad85c80de1686d4aaf2fe1bf26da6f8a451f054e30b3ce0f3',1,'DuckTypes.h']]]
 ];

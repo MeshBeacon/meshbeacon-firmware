@@ -113,7 +113,7 @@ Public Member Functions</h2></td></tr>
 <tr class="separator:a1ac33b168c2d379bcf12952008d015eb"><td class="memSeparator" colspan="2">&#160;</td></tr>
 <tr class="memitem:a6de392fa3dccf2bc9283e6f79ba4340f" id="r_a6de392fa3dccf2bc9283e6f79ba4340f"><td class="memItemLeft" align="right" valign="top"><a class="el" href="class_duck_lo_ra.html">DuckLoRa</a> &amp;&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="class_duck_lo_ra.html#a6de392fa3dccf2bc9283e6f79ba4340f">operator=</a> (<a class="el" href="class_duck_lo_ra.html">DuckLoRa</a> const &amp;)=delete</td></tr>
 <tr class="separator:a6de392fa3dccf2bc9283e6f79ba4340f"><td class="memSeparator" colspan="2">&#160;</td></tr>
-<tr class="memitem:a57d049535a75ecc7b55ebb08a7daa5b1" id="r_a57d049535a75ecc7b55ebb08a7daa5b1"><td class="memItemLeft" align="right" valign="top">int&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="class_duck_lo_ra.html#a57d049535a75ecc7b55ebb08a7daa5b1">setupRadio</a> (const <a class="el" href="struct_lo_ra_config_params.html">LoRaConfigParams</a> &amp;config=<a class="el" href="class_duck_lo_ra.html#a0e2a57e07389af6d269da73b00f4f293">defaultRadioParams</a>)</td></tr>
+<tr class="memitem:a57d049535a75ecc7b55ebb08a7daa5b1" id="r_a57d049535a75ecc7b55ebb08a7daa5b1"><td class="memItemLeft" align="right" valign="top">int&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="class_duck_lo_ra.html#a57d049535a75ecc7b55ebb08a7daa5b1">setupRadio</a> (const <a class="el" href="struct_lo_ra_config_params.html">LoRaConfigParams</a> &amp;config=<a class="el" href="class_duck_lo_ra.html#afe1879be508c60d7ebaa4652a5189eec">defaultRadioParams</a>)</td></tr>
 <tr class="memdesc:a57d049535a75ecc7b55ebb08a7daa5b1"><td class="mdescLeft">&#160;</td><td class="mdescRight">Initialize the LoRa chip.  <br /></td></tr>
 <tr class="separator:a57d049535a75ecc7b55ebb08a7daa5b1"><td class="memSeparator" colspan="2">&#160;</td></tr>
 <tr class="memitem:a4935020a0e813de0279743780bd9934c" id="r_a4935020a0e813de0279743780bd9934c"><td class="memItemLeft" align="right" valign="top">int&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="class_duck_lo_ra.html#a4935020a0e813de0279743780bd9934c">sendData</a> (uint8_t *data, int length)</td></tr>
@@ -134,12 +134,6 @@ Public Member Functions</h2></td></tr>
 <tr class="memitem:a0ff1b5a694b6214679ed48b6cfbcfbff" id="r_a0ff1b5a694b6214679ed48b6cfbcfbff"><td class="memItemLeft" align="right" valign="top">float&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="class_duck_lo_ra.html#a0ff1b5a694b6214679ed48b6cfbcfbff">getSNR</a> ()</td></tr>
 <tr class="memdesc:a0ff1b5a694b6214679ed48b6cfbcfbff"><td class="mdescLeft">&#160;</td><td class="mdescRight">Get the current SNR value.  <br /></td></tr>
 <tr class="separator:a0ff1b5a694b6214679ed48b6cfbcfbff"><td class="memSeparator" colspan="2">&#160;</td></tr>
-<tr class="memitem:abcfc3cb88ab5baa9664a61c20e2c1c38" id="r_abcfc3cb88ab5baa9664a61c20e2c1c38"><td class="memItemLeft" align="right" valign="top">float&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="class_duck_lo_ra.html#abcfc3cb88ab5baa9664a61c20e2c1c38">getRandomUplinkChannel</a> ()</td></tr>
-<tr class="memdesc:abcfc3cb88ab5baa9664a61c20e2c1c38"><td class="mdescLeft">&#160;</td><td class="mdescRight">Pick a uniformly random channel from CDPCFG_UPLINK_CHANNEL_POOL.  <br /></td></tr>
-<tr class="separator:abcfc3cb88ab5baa9664a61c20e2c1c38"><td class="memSeparator" colspan="2">&#160;</td></tr>
-<tr class="memitem:af8e4782bd0f52c042a481be2bddff87f" id="r_af8e4782bd0f52c042a481be2bddff87f"><td class="memItemLeft" align="right" valign="top">int&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="class_duck_lo_ra.html#af8e4782bd0f52c042a481be2bddff87f">setUplinkFrequency</a> (float freqMHz)</td></tr>
-<tr class="memdesc:af8e4782bd0f52c042a481be2bddff87f"><td class="mdescLeft">&#160;</td><td class="mdescRight">Temporarily switch the radio to the given frequency for an uplink transmission. The mesh channel (CDPCFG_RF_LORA_FREQ) is automatically restored after the transmission completes, in the TX_DONE interrupt handling done by <a class="el" href="class_duck_lo_ra.html#a889bd584b29b55901cb3d3214031028e" title="Service the RadioLib SX127x and SX126x interrupt flags.">serviceInterruptFlags()</a>.  <br /></td></tr>
-<tr class="separator:af8e4782bd0f52c042a481be2bddff87f"><td class="memSeparator" colspan="2">&#160;</td></tr>
 </table><table class="memberdecls">
 <tr class="heading"><td colspan="2"><h2 class="groupheader"><a id="pub-static-methods" name="pub-static-methods"></a>
 Static Public Member Functions</h2></td></tr>
@@ -149,10 +143,8 @@ Static Public Member Functions</h2></td></tr>
 </table><table class="memberdecls">
 <tr class="heading"><td colspan="2"><h2 class="groupheader"><a id="pub-static-attribs" name="pub-static-attribs"></a>
 Static Public Attributes</h2></td></tr>
-<tr class="memitem:a0e2a57e07389af6d269da73b00f4f293" id="r_a0e2a57e07389af6d269da73b00f4f293"><td class="memItemLeft" align="right" valign="top">static <a class="el" href="struct_lo_ra_config_params.html">LoRaConfigParams</a>&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="class_duck_lo_ra.html#a0e2a57e07389af6d269da73b00f4f293">defaultRadioParams</a></td></tr>
-<tr class="separator:a0e2a57e07389af6d269da73b00f4f293"><td class="memSeparator" colspan="2">&#160;</td></tr>
-<tr class="memitem:ab1ba9c0bd1bfb1cacabc61bb9ae0d616" id="r_ab1ba9c0bd1bfb1cacabc61bb9ae0d616"><td class="memItemLeft" align="right" valign="top">static float&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="class_duck_lo_ra.html#ab1ba9c0bd1bfb1cacabc61bb9ae0d616">uplinkChannelPool</a> [8] = <a class="el" href="cdpcfg_8h.html#a2d83a01ce3af4184b6b3c42408a7641d">CDPCFG_UPLINK_CHANNEL_POOL</a></td></tr>
-<tr class="separator:ab1ba9c0bd1bfb1cacabc61bb9ae0d616"><td class="memSeparator" colspan="2">&#160;</td></tr>
+<tr class="memitem:afe1879be508c60d7ebaa4652a5189eec" id="r_afe1879be508c60d7ebaa4652a5189eec"><td class="memItemLeft" align="right" valign="top">static const <a class="el" href="struct_lo_ra_config_params.html">LoRaConfigParams</a>&#160;</td><td class="memItemRight" valign="bottom"><a class="el" href="class_duck_lo_ra.html#afe1879be508c60d7ebaa4652a5189eec">defaultRadioParams</a></td></tr>
+<tr class="separator:afe1879be508c60d7ebaa4652a5189eec"><td class="memSeparator" colspan="2">&#160;</td></tr>
 </table>
 <h2 class="groupheader">Constructor &amp; Destructor Documentation</h2>
 <a id="a2a572ca25a87a204b537cf89bc06fcd7" name="a2a572ca25a87a204b537cf89bc06fcd7"></a>
@@ -207,27 +199,6 @@ Static Public Attributes</h2></td></tr>
 </div>
 </div>
 <h2 class="groupheader">Member Function Documentation</h2>
-<a id="abcfc3cb88ab5baa9664a61c20e2c1c38" name="abcfc3cb88ab5baa9664a61c20e2c1c38"></a>
-<h2 class="memtitle"><span class="permalink"><a href="#abcfc3cb88ab5baa9664a61c20e2c1c38">&#9670;&#160;</a></span>getRandomUplinkChannel()</h2>
-
-<div class="memitem">
-<div class="memproto">
-      <table class="memname">
-        <tr>
-          <td class="memname">float DuckLoRa::getRandomUplinkChannel </td>
-          <td>(</td>
-          <td class="paramname"></td><td>)</td>
-          <td></td>
-        </tr>
-      </table>
-</div><div class="memdoc">
-
-<p>Pick a uniformly random channel from CDPCFG_UPLINK_CHANNEL_POOL. </p>
-<p>Used to spread uplink traffic (packets originated locally and addressed directly to <a class="el" href="class_papa_duck.html">PapaDuck</a>) across the gateway's SX1302 multi-SF demodulators. See docs/uplink-channel-spreading.md.</p>
-<dl class="section return"><dt>Returns</dt><dd>frequency in MHz of the randomly selected uplink channel. </dd></dl>
-
-</div>
-</div>
 <a id="a946c2dd9d8667051f6b99a929d510ede" name="a946c2dd9d8667051f6b99a929d510ede"></a>
 <h2 class="memtitle"><span class="permalink"><a href="#a946c2dd9d8667051f6b99a929d510ede">&#9670;&#160;</a></span>getReceiveFlag()</h2>
 
@@ -426,33 +397,6 @@ Static Public Attributes</h2></td></tr>
 
 </div>
 </div>
-<a id="af8e4782bd0f52c042a481be2bddff87f" name="af8e4782bd0f52c042a481be2bddff87f"></a>
-<h2 class="memtitle"><span class="permalink"><a href="#af8e4782bd0f52c042a481be2bddff87f">&#9670;&#160;</a></span>setUplinkFrequency()</h2>
-
-<div class="memitem">
-<div class="memproto">
-      <table class="memname">
-        <tr>
-          <td class="memname">int DuckLoRa::setUplinkFrequency </td>
-          <td>(</td>
-          <td class="paramtype">float&#160;</td>
-          <td class="paramname"><em>freqMHz</em></td><td>)</td>
-          <td></td>
-        </tr>
-      </table>
-</div><div class="memdoc">
-
-<p>Temporarily switch the radio to the given frequency for an uplink transmission. The mesh channel (CDPCFG_RF_LORA_FREQ) is automatically restored after the transmission completes, in the TX_DONE interrupt handling done by <a class="el" href="class_duck_lo_ra.html#a889bd584b29b55901cb3d3214031028e" title="Service the RadioLib SX127x and SX126x interrupt flags.">serviceInterruptFlags()</a>. </p>
-<dl class="params"><dt>Parameters</dt><dd>
-  <table class="params">
-    <tr><td class="paramname">freqMHz</td><td>frequency in MHz to switch to </td></tr>
-  </table>
-  </dd>
-</dl>
-<dl class="section return"><dt>Returns</dt><dd>DUCK_ERR_NONE if the frequency was set successfully, an error code otherwise. </dd></dl>
-
-</div>
-</div>
 <a id="a57d049535a75ecc7b55ebb08a7daa5b1" name="a57d049535a75ecc7b55ebb08a7daa5b1"></a>
 <h2 class="memtitle"><span class="permalink"><a href="#a57d049535a75ecc7b55ebb08a7daa5b1">&#9670;&#160;</a></span>setupRadio()</h2>
 
@@ -463,7 +407,7 @@ Static Public Attributes</h2></td></tr>
           <td class="memname">int DuckLoRa::setupRadio </td>
           <td>(</td>
           <td class="paramtype">const <a class="el" href="struct_lo_ra_config_params.html">LoRaConfigParams</a> &amp;&#160;</td>
-          <td class="paramname"><em>config</em> = <code><a class="el" href="class_duck_lo_ra.html#a0e2a57e07389af6d269da73b00f4f293">defaultRadioParams</a></code></td><td>)</td>
+          <td class="paramname"><em>config</em> = <code><a class="el" href="class_duck_lo_ra.html#afe1879be508c60d7ebaa4652a5189eec">defaultRadioParams</a></code></td><td>)</td>
           <td></td>
         </tr>
       </table>
@@ -481,8 +425,8 @@ Static Public Attributes</h2></td></tr>
 </div>
 </div>
 <h2 class="groupheader">Member Data Documentation</h2>
-<a id="a0e2a57e07389af6d269da73b00f4f293" name="a0e2a57e07389af6d269da73b00f4f293"></a>
-<h2 class="memtitle"><span class="permalink"><a href="#a0e2a57e07389af6d269da73b00f4f293">&#9670;&#160;</a></span>defaultRadioParams</h2>
+<a id="afe1879be508c60d7ebaa4652a5189eec" name="afe1879be508c60d7ebaa4652a5189eec"></a>
+<h2 class="memtitle"><span class="permalink"><a href="#afe1879be508c60d7ebaa4652a5189eec">&#9670;&#160;</a></span>defaultRadioParams</h2>
 
 <div class="memitem">
 <div class="memproto">
@@ -491,7 +435,7 @@ Static Public Attributes</h2></td></tr>
   <td class="mlabels-left">
       <table class="memname">
         <tr>
-          <td class="memname"><a class="el" href="struct_lo_ra_config_params.html">LoRaConfigParams</a> DuckLoRa::defaultRadioParams</td>
+          <td class="memname">const <a class="el" href="struct_lo_ra_config_params.html">LoRaConfigParams</a> DuckLoRa::defaultRadioParams</td>
         </tr>
       </table>
   </td>
@@ -508,34 +452,12 @@ Static Public Attributes</h2></td></tr>
 <div class="line">     <a class="code hl_define" href="cdpcfg_8h.html#ac48828218af573b698154ab3300d5714">CDPCFG_RF_LORA_GAIN</a>,</div>
 <div class="line">     onInterrupt</div>
 <div class="line">}</div>
-<div class="ttc" id="acdpcfg_8h_html_a76429eb9d4f8fd3dc8c8fc902e9eb8fd"><div class="ttname"><a href="cdpcfg_8h.html#a76429eb9d4f8fd3dc8c8fc902e9eb8fd">CDPCFG_RF_LORA_FREQ</a></div><div class="ttdeci">#define CDPCFG_RF_LORA_FREQ</div><div class="ttdoc">Frequency Range. Set for US Region 915.0Mhz, Asia Region AS923 is below 923.0Mhz.</div><div class="ttdef"><b>Definition</b> cdpcfg.h:72</div></div>
-<div class="ttc" id="acdpcfg_8h_html_aa533f097df8cb6cd2b29e1c6f9f056cd"><div class="ttname"><a href="cdpcfg_8h.html#aa533f097df8cb6cd2b29e1c6f9f056cd">CDPCFG_RF_LORA_SF</a></div><div class="ttdeci">#define CDPCFG_RF_LORA_SF</div><div class="ttdoc">Spread Factor.</div><div class="ttdef"><b>Definition</b> cdpcfg.h:102</div></div>
-<div class="ttc" id="acdpcfg_8h_html_ac48828218af573b698154ab3300d5714"><div class="ttname"><a href="cdpcfg_8h.html#ac48828218af573b698154ab3300d5714">CDPCFG_RF_LORA_GAIN</a></div><div class="ttdeci">#define CDPCFG_RF_LORA_GAIN</div><div class="ttdoc">Antenna Gain correction.</div><div class="ttdef"><b>Definition</b> cdpcfg.h:106</div></div>
-<div class="ttc" id="acdpcfg_8h_html_adc07e97b79250ddfd7c8e2dc119e892f"><div class="ttname"><a href="cdpcfg_8h.html#adc07e97b79250ddfd7c8e2dc119e892f">CDPCFG_RF_LORA_BW</a></div><div class="ttdeci">#define CDPCFG_RF_LORA_BW</div><div class="ttdoc">Bandwidth. Default is 125Mhz.</div><div class="ttdef"><b>Definition</b> cdpcfg.h:75</div></div>
-<div class="ttc" id="acdpcfg_8h_html_afca851cc09f5d10dc4879edaff55b5f6"><div class="ttname"><a href="cdpcfg_8h.html#afca851cc09f5d10dc4879edaff55b5f6">CDPCFG_RF_LORA_TXPOW</a></div><div class="ttdeci">#define CDPCFG_RF_LORA_TXPOW</div><div class="ttdoc">Transmit Power.</div><div class="ttdef"><b>Definition</b> cdpcfg.h:104</div></div>
+<div class="ttc" id="acdpcfg_8h_html_a76429eb9d4f8fd3dc8c8fc902e9eb8fd"><div class="ttname"><a href="cdpcfg_8h.html#a76429eb9d4f8fd3dc8c8fc902e9eb8fd">CDPCFG_RF_LORA_FREQ</a></div><div class="ttdeci">#define CDPCFG_RF_LORA_FREQ</div><div class="ttdoc">Frequency Range. Set for US Region 915.0Mhz.</div><div class="ttdef"><b>Definition</b> cdpcfg.h:68</div></div>
+<div class="ttc" id="acdpcfg_8h_html_aa533f097df8cb6cd2b29e1c6f9f056cd"><div class="ttname"><a href="cdpcfg_8h.html#aa533f097df8cb6cd2b29e1c6f9f056cd">CDPCFG_RF_LORA_SF</a></div><div class="ttdeci">#define CDPCFG_RF_LORA_SF</div><div class="ttdoc">Spread Factor.</div><div class="ttdef"><b>Definition</b> cdpcfg.h:73</div></div>
+<div class="ttc" id="acdpcfg_8h_html_ac48828218af573b698154ab3300d5714"><div class="ttname"><a href="cdpcfg_8h.html#ac48828218af573b698154ab3300d5714">CDPCFG_RF_LORA_GAIN</a></div><div class="ttdeci">#define CDPCFG_RF_LORA_GAIN</div><div class="ttdoc">Antenna Gain correction.</div><div class="ttdef"><b>Definition</b> cdpcfg.h:77</div></div>
+<div class="ttc" id="acdpcfg_8h_html_adc07e97b79250ddfd7c8e2dc119e892f"><div class="ttname"><a href="cdpcfg_8h.html#adc07e97b79250ddfd7c8e2dc119e892f">CDPCFG_RF_LORA_BW</a></div><div class="ttdeci">#define CDPCFG_RF_LORA_BW</div><div class="ttdoc">Bandwidth. Default is 125Mhz.</div><div class="ttdef"><b>Definition</b> cdpcfg.h:71</div></div>
+<div class="ttc" id="acdpcfg_8h_html_afca851cc09f5d10dc4879edaff55b5f6"><div class="ttname"><a href="cdpcfg_8h.html#afca851cc09f5d10dc4879edaff55b5f6">CDPCFG_RF_LORA_TXPOW</a></div><div class="ttdeci">#define CDPCFG_RF_LORA_TXPOW</div><div class="ttdoc">Transmit Power.</div><div class="ttdef"><b>Definition</b> cdpcfg.h:75</div></div>
 </div><!-- fragment -->
-</div>
-</div>
-<a id="ab1ba9c0bd1bfb1cacabc61bb9ae0d616" name="ab1ba9c0bd1bfb1cacabc61bb9ae0d616"></a>
-<h2 class="memtitle"><span class="permalink"><a href="#ab1ba9c0bd1bfb1cacabc61bb9ae0d616">&#9670;&#160;</a></span>uplinkChannelPool</h2>
-
-<div class="memitem">
-<div class="memproto">
-<table class="mlabels">
-  <tr>
-  <td class="mlabels-left">
-      <table class="memname">
-        <tr>
-          <td class="memname">float DuckLoRa::uplinkChannelPool = <a class="el" href="cdpcfg_8h.html#a2d83a01ce3af4184b6b3c42408a7641d">CDPCFG_UPLINK_CHANNEL_POOL</a></td>
-        </tr>
-      </table>
-  </td>
-  <td class="mlabels-right">
-<span class="mlabels"><span class="mlabel">static</span></span>  </td>
-  </tr>
-</table>
-</div><div class="memdoc">
-
 </div>
 </div>
 <hr/>The documentation for this class was generated from the following files:<ul>

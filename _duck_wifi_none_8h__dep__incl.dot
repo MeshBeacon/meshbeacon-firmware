@@ -15,5 +15,4 @@ digraph "/home/runner/work/meshbeacon-firmware/meshbeacon-firmware/src/wifi/Duck
   Node5 [id="Node000005",label="/home/runner/work/meshbeacon\l-firmware/meshbeacon-firmware\l/src/Ducks/MamaDuck.h",height=0.2,width=0.4,color="grey40", fillcolor="white", style="filled",URL="$_mama_duck_8h.html",tooltip=" "];
   Node2 -> Node6 [id="edge5_Node000002_Node000006",dir="back",color="steelblue1",style="solid",tooltip=" "];
   Node6 [id="Node000006",label="/home/runner/work/meshbeacon\l-firmware/meshbeacon-firmware\l/src/Ducks/PapaDuck.h",height=0.2,width=0.4,color="grey40", fillcolor="white", style="filled",URL="$_papa_duck_8h.html",tooltip=" "];
-  Node1 -> Node6 [id="edge6_Node000001_Node000006",dir="back",color="steelblue1",style="solid",tooltip=" "];
 }

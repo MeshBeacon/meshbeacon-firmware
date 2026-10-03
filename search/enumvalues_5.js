@@ -1,5 +1,4 @@
 var searchData=
 [
-  ['searching_0',['SEARCHING',['../_duck_router_8h.html#a350d04c55f1ef121ca2c7396cae452a0adb46ca6757195ce8c1f015c9781d869e',1,'DuckRouter.h']]],
-  ['sg_1',['SG',['../namespaceradioregionconfig.html#ac7aec13608eabefa3b671a52136a8765a0f177369a3b71275d25ab1b44db9f95f',1,'radioregionconfig']]]
+  ['unknown_0',['UNKNOWN',['../_duck_types_8h.html#ae840cd9270fc5804ad85c80de1686d4aa6ce26a62afab55d7606ad4e92428b30c',1,'DuckTypes.h']]]
 ];

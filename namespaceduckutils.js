@@ -9,7 +9,6 @@ var namespaceduckutils =
     [ "getDetectState", "namespaceduckutils.html#a4767620f654cbb1e876562754cffb77a", null ],
     [ "getErrorString", "namespaceduckutils.html#a9f5c50360f2e8a77f3347b41af29cbc8", null ],
     [ "getRandomBytes", "namespaceduckutils.html#af78c3c72848c8c50effe19cd5edc25d3", null ],
-    [ "hexStringToArray", "namespaceduckutils.html#aaafe2e310f84ca2e788288796f7939f7", null ],
     [ "isEqual", "namespaceduckutils.html#a97f2ca60c96157b104216f166439f78b", null ],
     [ "isEqual", "namespaceduckutils.html#a73122238e9e6161a781b25f4a74cca44", null ],
     [ "stringToArray", "namespaceduckutils.html#a46c1f1a9161c53d8489a80aa75a2b8a8", null ],
