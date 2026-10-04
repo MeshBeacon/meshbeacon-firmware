@@ -1,4 +1,4 @@
-name: Language Variants Build (Heltec V3 / Wio Tracker L1 Pro / T1000-E)
+name: Language Variants Build (Heltec V3 / Wio Tracker L1 Pro / T1000-E / Solar P1-Pro)
 
 on:
   push:
@@ -7,6 +7,7 @@ on:
       - 'examples/Basic-Ducks/Heltec/**'
       - 'examples/Basic-Ducks/Seeed/WioTrackerL1/**'
       - 'examples/Basic-Ducks/Seeed/T1000E/**'
+      - 'examples/Basic-Ducks/Seeed/SolarP1Pro/**'
       - 'tools/**'
       - 'boards/**'
       - 'platformio.ini'
@@ -17,6 +18,7 @@ on:
       - 'examples/Basic-Ducks/Heltec/**'
       - 'examples/Basic-Ducks/Seeed/WioTrackerL1/**'
       - 'examples/Basic-Ducks/Seeed/T1000E/**'
+      - 'examples/Basic-Ducks/Seeed/SolarP1Pro/**'
       - 'tools/**'
       - 'boards/**'
       - 'platformio.ini'
@@ -50,6 +52,13 @@ jobs:
           - name: T1000-E
             env: local_t1000e
             example_dir: Basic-Ducks/Seeed/T1000E
+            lang_flag: ''
+          # Solar P1-Pro has no OLED either (NullDisplayAdapter / no-op
+          # dspStr()), so DUCK_LANG_EN has no observable effect -- one
+          # build suffices, same as T1000-E above.
+          - name: Solar P1-Pro
+            env: local_solar_p1_pro
+            example_dir: Basic-Ducks/Seeed/SolarP1Pro
             lang_flag: ''
 
     steps:
