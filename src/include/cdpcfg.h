@@ -23,6 +23,7 @@
 #include "boards/lilygo_sim7000g_lora.h"
 #include "boards/seeed_wio_tracker_l1.h"
 #include "boards/seeed_t1000e.h"
+#include "boards/seeed_solar_p1_pro.h"
 #endif
 
 // version definitions

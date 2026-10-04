@@ -1,24 +1,42 @@
 /**
- * @file MamaDuck.ino — Seeed SenseCAP Card Tracker T1000-E (nRF52840 + LR1110)
+ * @file MamaDuck.ino — Seeed SenseCAP Solar Node P1-Pro (nRF52840 + SX1262)
  * @brief MamaDuck example using ClusterDuck Protocol on the nRF52840 platform.
  *
- * Hardware: Seeed SenseCAP Card Tracker T1000-E
- *   - MCU:     nRF52840 @ 64 MHz
- *   - Radio:   LR1110 (SPI, TCXO 1.6 V, DIO5-8 RF/GNSS switch matrix)
- *   - Display: none
- *   - GPS:     Airoha GNSS NMEA (Serial1, 115200 baud)
+ * Hardware: Seeed SenseCAP Solar Node P1-Pro for MeshCore
+ *   - MCU:     nRF52840 @ 64 MHz (Xiao nRF52840 Plus)
+ *   - Radio:   SX1262 (SPI, TCXO 1.8 V, DIO2 RF switch) -- same Wio-SX1262
+ *              add-on module as the Wio Tracker L1 Pro.
+ *   - Display: none (outdoor solar node/repeater; status via LEDs only)
+ *   - GPS:     L76K NMEA (Serial1, 9600 baud)
+ *   - Power:   5W solar panel + 4x 18650 battery, no buzzer.
  *
- * Ported from examples/Basic-Ducks/Seeed/WioTrackerL1/MamaDuck.ino (nRF52840 /
- * SX1262 / SH1106 OLED). Platform differences from that board:
- *   - LR1110 replaces SX1262 (different radio driver branch in DuckLoRa.cpp).
+ * Ported from examples/Basic-Ducks/Seeed/WioTrackerL1/MamaDuck.ino. Platform
+ * differences from that board:
  *   - No display: all dsp*() helpers and the IDuckDisplay implementation are
- *     no-ops (see NullDisplayAdapter below) -- this board has no OLED.
- *   - Airoha GNSS replaces the L76KB GPS module; GPS enable/reset is handled
- *     by variant.cpp's initVariant() before setup() runs, and no MediaTek
- *     PMTK constellation command is sent (Airoha does not use PMTK).
- *   - LED/button/buzzer/battery pins differ (see variant.h).
+ *     no-ops (NullDisplayAdapter, same pattern as the T1000E port) -- this
+ *     board has no OLED.
+ *   - No buzzer: this board's hardware (per Seeed's spec sheet: power/reset/
+ *     user-defined buttons, 4 status LEDs) has no buzzer, unlike
+ *     WioTrackerL1's D12 passive buzzer. beepBuzzer() is a no-op; every
+ *     call site elsewhere in this file is unchanged (audible feedback is
+ *     simply absent on this board -- LED blinks still provide visual
+ *     feedback for the same events).
+ *   - BAT_READ (VBAT_ENABLE) is active LOW on this board (opposite polarity
+ *     from WioTrackerL1's active-HIGH divider enable), and is already
+ *     permanently asserted enabled by variant.cpp's initVariant() at boot
+ *     -- readVbat() here does not toggle it per-read (see readVbat()).
+ *   - LEDs are on P0 (PIN_LED1=P0.15, PIN_LED2=P0.19), not P1 like
+ *     WioTrackerL1 -- BLINK_LED/HardFault_Handler raw-register blink
+ *     helpers use NRF_P0 instead of NRF_P1.
+ *   - CANCEL_BUTTON_ACTIVE_PULLUP is false for this board (external pull
+ *     assumed) -- the button pin is configured as plain INPUT, not
+ *     INPUT_PULLUP.
+ *   - Pin roles were cross-referenced from meshcore-dev/MeshCore's shipped
+ *     variants/sensecap_solar/ port (same physical hardware), since Seeed
+ *     does not publish a carrier-board schematic for this product -- see
+ *     boards/seeed_solar_p1_pro/variant.h for details.
  *
- * @date 2025-07-01
+ * @date 2026-10-04
  */
 
 #include <string>
@@ -69,9 +87,9 @@ static int32_t currentRssiDbm() {
 }
 
 // ── Board sanity check ────────────────────────────────────────────────────────
-#ifndef ARDUINO_SEEED_T1000E
-#error "This sketch is for the Seeed SenseCAP Card Tracker T1000-E. \
-Define ARDUINO_SEEED_T1000E (or use env:local_t1000e)."
+#ifndef ARDUINO_SEEED_SOLAR_P1_PRO
+#error "This sketch is for the Seeed SenseCAP Solar Node P1-Pro. \
+Define ARDUINO_SEEED_SOLAR_P1_PRO (or use env:local_solar_p1_pro)."
 #endif
 
 // ── Identification ────────────────────────────────────────────────────────────
@@ -94,24 +112,13 @@ static TinyGPSPlus tinyGps;
 static bool gpsModuleDetected = false;
 static bool gpsFix            = false;
 
-// Pulses GPS_RTC_INT ("normal LOW, wake by HIGH" -- see variant.h) to ask the
-// Airoha GNSS module to resume from its own low-power/RTC-only idle state.
-// initVariant() only ever drives this pin LOW once at boot, so without this,
-// nothing ever asks the module to wake back up once it goes idle -- including
-// right when a LoRa-originated GPS location request comes in and needs a
-// fresh fix.
-static void wakeGnss() {
-    digitalWrite(GPS_RTC_INT, HIGH);
-    delay(10);
-    digitalWrite(GPS_RTC_INT, LOW);
-}
-
 // ── Display ───────────────────────────────────────────────────────────────────
-// This board has no display of any kind (HAS_SCREEN 0 in variant.h). All the
-// dsp*() helpers and the IDuckDisplay implementation below are no-ops so the
-// rest of this sketch (ported from a board with an OLED) compiles and runs
-// unchanged -- every dspStr()/dspBegin()/etc. call elsewhere in this file is
-// a harmless no-op on this hardware.
+// This board has no display of any kind (HAS_SCREEN 0 in variant.h; outdoor
+// solar node/repeater, status is conveyed via LEDs only). All the dsp*()
+// helpers and the IDuckDisplay implementation below are no-ops so the rest
+// of this sketch (ported from the OLED-equipped WioTrackerL1) compiles and
+// runs unchanged -- every dspStr()/dspBegin()/etc. call elsewhere in this
+// file is a harmless no-op on this hardware.
 
 // enum BtnEvent is declared near the top of the file (right before
 // currentRssiDbm()) so it precedes every function definition, per
@@ -240,6 +247,8 @@ const  unsigned long SOS_ACK_DISPLAY_MS     = 10000UL;
 
 // Beep requests from duck.run() callbacks are deferred here and executed in
 // loop() after duck.run() returns, avoiding recursive duck.run() deadlocks.
+// (On this board beepBuzzer() is a no-op -- see below -- but the deferral
+// mechanism is kept so the rest of the ported code is unchanged.)
 static struct { int times; int onMs; int offMs; } gBeepReq = {};
 
 // ── Battery ───────────────────────────────────────────────────────────────────
@@ -334,14 +343,15 @@ extern "C" __attribute__((naked, used)) void SVC_Handler(void) {
 
 // Override BSP's HardFault_Handler (NVIC_SystemReset) with SOS LED blinks
 // so a fault is visible without a serial monitor.  debug.cpp patched weak.
+// PIN_LED1 is raw pin 15 = P0.15 on this board (unlike WioTrackerL1's P1.01).
 extern "C" void HardFault_Handler(void) {
-    NRF_P0->DIRSET = (1u << 24);
+    NRF_P0->DIRSET = (1u << 15);
     while (true) {
-        for (int i=0;i<3;i++){NRF_P0->OUTSET=(1u<<24);for(volatile uint32_t d=0;d<1920000u;d++){}NRF_P0->OUTCLR=(1u<<24);for(volatile uint32_t d=0;d<1920000u;d++){}}
+        for (int i=0;i<3;i++){NRF_P0->OUTSET=(1u<<15);for(volatile uint32_t d=0;d<1920000u;d++){}NRF_P0->OUTCLR=(1u<<15);for(volatile uint32_t d=0;d<1920000u;d++){}}
         for(volatile uint32_t d=0;d<3840000u;d++){}
-        for (int i=0;i<3;i++){NRF_P0->OUTSET=(1u<<24);for(volatile uint32_t d=0;d<6400000u;d++){}NRF_P0->OUTCLR=(1u<<24);for(volatile uint32_t d=0;d<3200000u;d++){}}
+        for (int i=0;i<3;i++){NRF_P0->OUTSET=(1u<<15);for(volatile uint32_t d=0;d<6400000u;d++){}NRF_P0->OUTCLR=(1u<<15);for(volatile uint32_t d=0;d<3200000u;d++){}}
         for(volatile uint32_t d=0;d<3840000u;d++){}
-        for (int i=0;i<3;i++){NRF_P0->OUTSET=(1u<<24);for(volatile uint32_t d=0;d<1920000u;d++){}NRF_P0->OUTCLR=(1u<<24);for(volatile uint32_t d=0;d<1920000u;d++){}}
+        for (int i=0;i<3;i++){NRF_P0->OUTSET=(1u<<15);for(volatile uint32_t d=0;d<1920000u;d++){}NRF_P0->OUTCLR=(1u<<15);for(volatile uint32_t d=0;d<1920000u;d++){}}
         for(volatile uint32_t d=0;d<9600000u;d++){}
     }
 }
@@ -391,8 +401,9 @@ static bool bleIsAdvertising() {
 
 // Called last in setup() — after Serial, display, GPS, CDP/LoRa are all stable.
 static void setupBLE() {
-    // Disable ConnLed: D12 is the BUZZER on Wio Tracker L1, not an LED.
-    // Without this, _startConnLed() fires a 4 Hz FreeRTOS timer that clicks the buzzer.
+    // Disable the Bluefruit library's automatic connection-LED blink timer --
+    // this board dedicates both LEDs to user/status indication, not a
+    // library-owned BLE connection indicator.
     Bluefruit.autoConnLed(false);
     Bluefruit.configPrphBandwidth(BANDWIDTH_MAX);
     bool ble_ok = Bluefruit.begin(1, 0);
@@ -447,24 +458,40 @@ static void setupBLE() {
 }
 
 // ── Busy-wait LED blink helper ─────────────────────────────────────────────
-// Works without FreeRTOS tick or any library.  LED is P0.24 (PIN_LED1).
+// Works without FreeRTOS tick or any library. PIN_LED1 is raw pin 15 = P0.15
+// on this board (unlike WioTrackerL1's P1.01) -- see variant.cpp.
 #define BLINK_LED(n) do { \
-    NRF_P0->DIRSET = (1u<<24); \
+    NRF_P0->DIRSET = (1u<<15); \
     for(int _b=0;_b<(n);_b++){ \
-        NRF_P0->OUTSET=(1u<<24); for(volatile uint32_t _d=0;_d<9600000u;_d++){} \
-        NRF_P0->OUTCLR=(1u<<24); for(volatile uint32_t _d=0;_d<9600000u;_d++){} \
+        NRF_P0->OUTSET=(1u<<15); for(volatile uint32_t _d=0;_d<9600000u;_d++){} \
+        NRF_P0->OUTCLR=(1u<<15); for(volatile uint32_t _d=0;_d<9600000u;_d++){} \
     } \
     for(volatile uint32_t _d=0;_d<32000000u;_d++){} \
 } while(0)
 
 // ── Battery ADC ───────────────────────────────────────────────────────────────
 static float readVbat() {
-    // No separate battery-read enable pin on this board (unlike WioTrackerL1's
-    // BAT_READ gate) -- BATTERY_PIN/ADC_MULTIPLIER are defined in variant.h.
-    // analogReadResolution(ADC_RESOLUTION) is called in setup(), so
-    // analogRead() returns a 14-bit value (0–16383).
+    // Unlike WioTrackerL1 (which toggles its active-HIGH BAT_READ gate only
+    // during a read to save power), this board's BAT_READ/VBAT_ENABLE is
+    // active LOW and already driven permanently enabled by variant.cpp's
+    // initVariant() at boot -- no per-read toggling is done here.
+    //
+    // This board's AREF_VOLTAGE/ADC_MULTIPLIER constants are calibrated for
+    // the nRF52's internal 3.0V reference at 12-bit resolution (BAT_READ/
+    // VBAT_ENABLE divider is 1M/512k) -- NOT the default ~3.6V supply
+    // reference WioTrackerL1 relies on at 14-bit. Confirmed via MeshCore's
+    // own SenseCapSolarBoard::getBattMilliVolts() (same hardware): it sets
+    // analogReference(AR_INTERNAL_3_0) + analogReadResolution(12) before
+    // every read and uses the identical "* ADC_MULTIPLIER * AREF_VOLTAGE /
+    // 4.096" formula. Our previous version never set analogReference() (so
+    // the ADC silently used the wrong default reference) and read at 14-bit
+    // -- producing a badly wrong, usually too-low voltage that always
+    // clamped to 0% in batteryPercent().
+    analogReference(AR_INTERNAL_3_0);
+    analogReadResolution(BATTERY_SENSE_RESOLUTION_BITS); // 12-bit
+    delay(10); // let the reference settle, matches MeshCore's reference impl
     float raw  = (float)analogRead(BATTERY_PIN);
-    float vbat = raw / (float)((1 << ADC_RESOLUTION) - 1) * AREF_VOLTAGE * ADC_MULTIPLIER;
+    float vbat = (raw * ADC_MULTIPLIER * AREF_VOLTAGE) / 4.096f / 1000.0f; // mV -> V
     return vbat;
 }
 
@@ -476,8 +503,8 @@ static int batteryPercent(float vbat) {
 
 // Draw a live progress bar while the SOS button is held, so the user gets
 // clear visual (not just audible) confirmation the hold is registering and
-// can see roughly how much longer is needed. Throttled by the caller so this
-// doesn't hammer the bit-banged SW-I2C bus every loop() iteration.
+// can see roughly how much longer is needed. No-op on this board (no
+// display hardware) -- kept so the rest of checkButton() is unchanged.
 static void showHoldProgress(uint32_t heldMs) {
     uint8_t pct = (uint8_t)constrain((heldMs * 100UL) / SOS_HOLD_MS, 0UL, 100UL);
     gDisplay.begin();
@@ -512,7 +539,7 @@ static BtnEvent checkButton() {
     const uint32_t DEBOUNCE_MS    = 30;    // raw reading must be stable this long before being trusted
     const uint32_t MIN_PRESS_MS   = 30;    // debounced press must last at least this long to count as a click
 
-    bool rawNow = (digitalRead(BUTTON_PIN) == HIGH);  // active HIGH (pull-down, per variant.h)
+    bool rawNow = (digitalRead(CANCEL_BUTTON_PIN) == LOW);  // active LOW (per variant.h)
     if (rawNow != rawDown) {
         rawDown     = rawNow;
         rawChangeMs = millis();
@@ -532,6 +559,8 @@ static BtnEvent checkButton() {
     // Live feedback while holding, so the user knows the SOS hold is being
     // registered and roughly how much longer to keep pressing (helps avoid
     // releasing too early, or wondering if the button is unresponsive).
+    // beepBuzzer() is a no-op on this board (no buzzer hardware) -- these
+    // calls are kept so the rest of the shared state machine is unchanged.
     if (wasDown && btnDown && !holdFired) {
         uint32_t heldMs = millis() - pressStartMs;
         if (holdBeepsFired < 1 && heldMs >= 500)  { beepBuzzer(1, 40, 0); holdBeepsFired = 1; }
@@ -613,38 +642,37 @@ void setup() {
     // kept.
 
     // ADC resolution — must be called before any analogRead().
-    // ADC_RESOLUTION = 14 is defined in variant.h; the BSP defaults to 10 if
-    // this call is omitted.  14-bit gives full-scale 16383 (0x3FFF).
+    // ADC_RESOLUTION = 14 is defined above; the BSP defaults to 10 if this
+    // call is omitted.  14-bit gives full-scale 16383 (0x3FFF).
     analogReadResolution(ADC_RESOLUTION);
 
-    // ADC reference — variant.h defines AREF_VOLTAGE 3.0 (matching the
-    // upstream Meshtastic tracker-t1000-e variant this board is based on),
-    // but the Adafruit nRF52 BSP defaults to the internal 3.6V/1:6-gain
-    // reference if analogReference() is never called. Without this call,
-    // readVbat()'s formula (which assumes a 3.0V full-scale) silently reads
-    // ~17% low against the actual 3.6V-referenced raw ADC codes, which
-    // clamps batteryPercent() to 0% for any real battery voltage -- i.e.
-    // every CDK:BATT frame still goes out, just with LEVEL:0, which looks
-    // like "battery never gets reported" on the phone app (same failure
-    // mode documented for the Heltec board's VBAT_CTRL polarity bug).
-#ifdef VBAT_AR_INTERNAL
-    analogReference(VBAT_AR_INTERNAL);
-#endif
-
-    // LED + Button + Buzzer
-    pinMode(PIN_LED1,     OUTPUT);
+    // LED + Button (no buzzer on this board -- see file header)
+    pinMode(PIN_LED1, OUTPUT);
     digitalWrite(PIN_LED1, LOW);
-    pinMode(PIN_BUZZER,   OUTPUT);              // active HIGH
-    digitalWrite(PIN_BUZZER, LOW);
-    pinMode(BUTTON_PIN, INPUT_PULLDOWN);        // active HIGH (per variant.h)
+    pinMode(PIN_LED2, OUTPUT);
+    digitalWrite(PIN_LED2, LOW);
+    // CANCEL_BUTTON_ACTIVE_PULLUP is false for this board (variant.h) -- a
+    // plain INPUT is used rather than INPUT_PULLUP, unlike WioTrackerL1.
+    pinMode(CANCEL_BUTTON_PIN, INPUT);   // active LOW (per variant.h)
 
-    // GPS — Airoha GNSS enable/reset sequence already ran in initVariant()
-    // (before setup()); just start the UART. No MediaTek PMTK constellation
-    // command is sent (Airoha does not use the PMTK protocol).
+    // GPS — wake the L76K before starting Serial1. GPS_EN is already driven
+    // HIGH (enabled, active-HIGH on this board) once by variant.cpp's
+    // initVariant() before setup() runs; PIN_GPS_STANDBY (GNSS_WAKEUP) is
+    // asserted here, same pattern as WioTrackerL1's L76KB.
+    pinMode(PIN_GPS_STANDBY, OUTPUT);
+    digitalWrite(PIN_GPS_STANDBY, HIGH);   // STDBY_N high = active
     Serial1.begin(GPS_BAUDRATE);
 
+    // Enable all three GNSS constellations for faster and more reliable signal acquisition.
+    // The L76K default is GPS-only; adding GLONASS + BeiDou roughly triples visible satellites.
+    // PMTK353: GPS(1) + GLONASS(1) + BeiDou(1) + Galileo(0) + NAVIC(0) — checksum 0x2A verified.
+    delay(100);  // brief settle time after module power-on
+    Serial1.println("$PMTK353,1,1,1,0,0*2A");
+    delay(50);
+
     // initDisplay() + dspStatus("Booting...") were moved to before the Serial
-    // wait at the top of setup() so the display always shows content on boot.
+    // wait at the top of setup() so the display always shows content on boot
+    // (no-op here, kept for structural parity with the OLED-equipped ports).
 
     // ── CDP init (LoRa / routing / storage) ─────────────────────────────────
     dspStatus("CDP init", DUCK_NAME);
@@ -678,8 +706,11 @@ void setup() {
     // BLE last).  setupBLE() calls Bluefruit.begin() and starts advertising.
     setupBLE();
 
+    // Re-assert GPS wakeup — BLE init can take several hundred ms.
+    digitalWrite(PIN_GPS_STANDBY, HIGH);
+
     // Re-configure button — defensive in case BLE/SD peripheral init disturbed it.
-    pinMode(BUTTON_PIN, INPUT_PULLDOWN);
+    pinMode(CANCEL_BUTTON_PIN, INPUT);
 
     Serial.println(String("CDK:ID,VALUE:") + DUCK_ID_BUF);
     sendBattery();
@@ -707,9 +738,7 @@ void loop() {
     if (!setupOK) return;
 
     // ── First-run display init ────────────────────────────────────────────────
-    // Deferred here so the [DISP] log appears AFTER serial is connected.
-    // I2C bus recovery (9 SCL clocks) frees any slave holding SDA low.
-    // Wait up to 5 s for the serial monitor to attach so [DISP] logs are visible.
+    // Wait up to 5 s for the serial monitor to attach so early logs are visible.
     static unsigned long loopFirstMs = 0;
     if (loopFirstMs == 0) loopFirstMs = millis();
     if (!Serial && millis() - loopFirstMs < 500) return;
@@ -717,10 +746,8 @@ void loop() {
     static bool displayProbed = false;
     if (!displayProbed) {
         displayProbed = true;
-        // Display was already initialised in setup(), where the boot logo
-        // splash already provided branding -- jump straight to the home
-        // screen instead of showing a second, now-redundant text banner
-        // (removes a 1000 ms delay to help keep overall boot time down).
+        // No-op on this board (gDisplayOk is always false); kept for
+        // structural parity with the OLED-equipped ports.
         if (gDisplayOk) {
             displayHome();
         }
@@ -1081,15 +1108,8 @@ void loop() {
     }
 
     // Feed GPS NMEA into TinyGPSPlus.
-    static unsigned long lastGpsByteMs = 0;
-    static unsigned long lastGpsWakeMs = 0;
-    const unsigned long  GPS_IDLE_WAKE_MS = 5000UL;  // no NMEA bytes for this long after the
-                                                      // module was previously seen means the
-                                                      // Airoha GNSS has likely dropped into its
-                                                      // own low-power/RTC-only idle state.
     while (Serial1.available()) {
         char c = Serial1.read();
-        lastGpsByteMs = millis();
         if (!gpsModuleDetected) {
             gpsModuleDetected = true;
             Serial.println("[GPS] Module detected");
@@ -1101,18 +1121,6 @@ void loop() {
         Serial.printf("[GPS] Fix: lat=%.6f lng=%.6f sats=%u\n",
                       tinyGps.location.lat(), tinyGps.location.lng(),
                       tinyGps.satellites.value());
-    }
-    // GPS idle watchdog: GPS_RTC_INT is documented ("normal LOW, wake by
-    // HIGH" -- see variant.h) as the wake-request line for the Airoha GNSS
-    // module, but initVariant() only ever drives it LOW once at boot and
-    // nothing else asserts it again. Once the module goes idle on its own
-    // and stops streaming NMEA, re-pulse this pin to ask it to resume.
-    if (gpsModuleDetected
-        && millis() - lastGpsByteMs >= GPS_IDLE_WAKE_MS
-        && millis() - lastGpsWakeMs >= GPS_IDLE_WAKE_MS) {
-        lastGpsWakeMs = millis();
-        Serial.println("[GPS] Idle watchdog: pulsing GPS_RTC_INT to request wake");
-        wakeGnss();
     }
 
     duck.run();
@@ -1211,15 +1219,6 @@ void loop() {
 // duckcrypto::decryptFromPeer() has verified the request came from
 // whoever holds OpenDMS's static private key.
 void handleGpsRequestCommand() {
-    if (!tinyGps.location.isValid()) {
-        // No local fix yet -- the GNSS module may be sitting idle (see
-        // wakeGnss()'s doc comment). Proactively request a wake right now
-        // instead of only relying on the background watchdog, so a
-        // LoRa-originated request doesn't have to wait up to
-        // GPS_IDLE_WAKE_MS for the next passive wake attempt.
-        Serial.println("[GPS] Location request with no fix: pulsing GPS_RTC_INT to request wake");
-        wakeGnss();
-    }
     if (tinyGps.location.isValid()) {
         float altM   = tinyGps.altitude.isValid() ? tinyGps.altitude.meters()  : 0.0f;
         float spdKh  = tinyGps.speed.isValid()    ? tinyGps.speed.kmph()        : 0.0f;
@@ -1400,7 +1399,7 @@ void handleDuckData(CdpPacket packet) {
                 if (millis() - lastSosAckMs < 5000UL) break;
                 lastSosAckMs         = millis();
                 sosAckDisplayPending = true;
-                gBeepReq = {1, 500, 0};  // deferred: 1 long beep = SOS acknowledged (relief)
+                gBeepReq = {1, 500, 0};  // deferred: 1 long beep = SOS acknowledged (relief); no-op on this board
                 broadcast("CDK:SOS_ACK,TEXT:SOS DITERIMA");
                 break;
             }
@@ -1409,7 +1408,7 @@ void handleDuckData(CdpPacket packet) {
                 break;
             }
             dspPowerSave(0);
-            beepBuzzer(1, 150, 0);     // immediate: beep before message appears
+            beepBuzzer(1, 150, 0);     // immediate: beep before message appears (no-op on this board)
             displayMessage(message);
             emergencyDisplayPending = true;
             displayEnabled          = true;
@@ -1485,7 +1484,7 @@ void handleDuckData(CdpPacket packet) {
                 message = String(opText.text);
               }
             }
-            beepBuzzer(3, 80, 80);     // immediate: alert before anything else
+            beepBuzzer(3, 80, 80);     // immediate: alert before anything else (no-op on this board)
             flashLED();
             broadcast(String("CDK:MSG,TEXT:") + message);
             {
@@ -1535,7 +1534,7 @@ void handleDuckData(CdpPacket packet) {
                   }
                 }
             }
-            beepBuzzer(3, 80, 80);     // rapid triple = emergency alert (announcement is danger)
+            beepBuzzer(3, 80, 80);     // rapid triple = emergency alert (no-op on this board)
             displayAnnouncement(broadcastText);
             blinkLed(1);
             broadcast(String("CDK:BCAST,TEXT:") + broadcastText);
@@ -1759,27 +1758,13 @@ void blinkLed(int times) {
     }
 }
 
-// Buzzer is PIN_BUZZER = P0.25 (passive buzzer — needs PWM at resonant frequency to be loud).
-// Safe to call from duck.run() callbacks: off-gaps use delay() not duck.run(),
-// avoiding recursive re-entry into the CDP stack.
-void beepBuzzer(int times, int onMs, int offMs) {
-    NRF_P0->DIRSET = (1u << 25);   // ensure PIN_BUZZER is output
-    for (int n = 0; n < times; n++) {
-        // Bit-bang ~2.5 kHz square wave for the on duration.
-        unsigned long endMs = millis() + (unsigned long)onMs;
-        while ((long)(endMs - millis()) > 0) {
-            NRF_P0->OUTSET = (1u << 25);
-            delayMicroseconds(200);
-            NRF_P0->OUTCLR = (1u << 25);
-            delayMicroseconds(200);
-        }
-        // Off gap: simple delay — safe from any call context.
-        if (n < times - 1 && offMs > 0) {
-            delay(offMs);
-        }
-    }
-    NRF_P0->OUTCLR = (1u << 25);   // ensure buzzer is silent after last beep
-}
+// No buzzer hardware on this board (per Seeed's spec sheet: power/reset/
+// user-defined buttons only, no buzzer) -- unlike WioTrackerL1's D12
+// passive buzzer. No-op so every call site elsewhere in this file (SOS
+// hold feedback, click ticks, alert tones, etc.) compiles unchanged;
+// visual feedback is still provided via blinkLed()/flashLED() at the same
+// call sites.
+void beepBuzzer(int /*times*/, int /*onMs*/, int /*offMs*/) {}
 
 // ── Battery ───────────────────────────────────────────────────────────────────
 void sendBattery() {
@@ -1833,9 +1818,9 @@ bool sendEmergency(String lat, String lng, String alt, String spd, String hdg, b
         dspStrCenter(46, hasGps ? TXT_WITH_GPS : TXT_WITHOUT_GPS);
         dspEnd();
         blinkLed(2);
-        if (!hasGps) {
-            beepBuzzer(2, 60, 60);  // distinct warning: sent, but no location included
-        }
+        // (no "sent, but no location" buzzer warning -- no buzzer hardware;
+        // the blinkLed(2) above and lack of LAT/LNG in the broadcast frame
+        // are the only feedback available on this board)
         {
             unsigned long endMs = millis() + 2000UL;
             while (millis() < endMs) { duck.run(); delay(10); }
@@ -1849,7 +1834,7 @@ bool sendEmergency(String lat, String lng, String alt, String spd, String hdg, b
         dspStrCenter(34, TXT_SEND_SIGNAL);
         dspStrCenter(46, TXT_EMERGENCY);
         dspEnd();
-        beepBuzzer(2, 60, 60);      // SOS failed — fast double = error
+        beepBuzzer(2, 60, 60);      // SOS failed — no-op on this board
     }
     return true;
 }
