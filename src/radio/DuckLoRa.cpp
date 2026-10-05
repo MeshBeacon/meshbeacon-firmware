@@ -259,7 +259,14 @@ int DuckLoRa::sendData(uint8_t* data, int length)
 void DuckLoRa::delay(size_t size) {
     // Delay the transmission if we have received within the last 5 seconds
     if ((millis() - this->lastReceiveTime) < 5000L) {
-        std::uniform_int_distribution<> distrib(0, 3000L);
+        // Max backoff reduced from 3000ms to 500ms: with a single half-duplex
+        // radio, the device cannot RX on the shared channel for the entire
+        // duration of this backoff plus TX airtime, so a long backoff window
+        // directly shrinks the odds that an inbound downlink arrives while
+        // we're still listening. 500ms keeps enough CSMA spread to avoid
+        // colliding with the packet that triggered this delay in the first
+        // place, while minimizing the self-inflicted RX blind spot.
+        std::uniform_int_distribution<> distrib(0, 500L);
         int txdelay_ms = distrib(gen);
 
         loginfo_ln("Last receive was %ld ms ago, delaying transmission by %d ms",
