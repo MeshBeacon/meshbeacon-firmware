@@ -55,7 +55,7 @@
 // which inserts all forward-declared function prototypes immediately
 // before the first function definition it finds -- sees this enum before
 // any prototype that returns/takes it (e.g. checkButton() further down).
-enum BtnEvent { BTN_NONE, BTN_SINGLE, BTN_DOUBLE, BTN_TRIPLE, BTN_QUAD, BTN_HOLD_2S };
+enum BtnEvent { BTN_NONE, BTN_SINGLE, BTN_DOUBLE, BTN_TRIPLE, BTN_QUAD };
 
 // Access the RadioLib radio instance from DuckLoRa.cpp to read RSSI/SNR.
 extern CDPCFG_LORA_CLASS lora;
@@ -212,7 +212,6 @@ static volatile bool  sosAckDisplayPending       = false;
 static bool           sosPending      = false;
 static unsigned long  sosWaitStartMs  = 0;
 const  unsigned long  SOS_GPS_WAIT_MS = 2500UL;
-const  uint32_t       SOS_HOLD_MS     = 2000UL;   // shared with checkButton()'s hold detection
 
 // ── GPS TX payload and phone GPS cache ───────────────────────────────────────
 static std::vector<uint8_t> gpsTxPayload;   // encoded protobuf payload for deferred GPS TX
@@ -224,6 +223,11 @@ static char phoneGpsHdgBuf[12] = {};
 static unsigned long gpsReqSentMs         = 0;
 static unsigned long gpsReqDeferredSendMs = 0;
 static unsigned long gpsDisplayClearMs    = 0;
+// True for the whole span of servicing a LoRa-originated CMD:GPS_REQUEST --
+// set as soon as handleGpsRequestCommand() starts, cleared once the request
+// is fully resolved (sent immediately, or the async phone-GPS wait/flush
+// pipeline below finishes). Drives the loop()-level LED blink in loop().
+static bool gpsReqLedActive = false;
 
 // ── Signal / TX tracking ─────────────────────────────────────────────────────
 static int           lastSignalPct        = -1;
@@ -474,19 +478,6 @@ static int batteryPercent(float vbat) {
     return (int)constrain(pct, 0.0f, 100.0f);
 }
 
-// Draw a live progress bar while the SOS button is held, so the user gets
-// clear visual (not just audible) confirmation the hold is registering and
-// can see roughly how much longer is needed. Throttled by the caller so this
-// doesn't hammer the bit-banged SW-I2C bus every loop() iteration.
-static void showHoldProgress(uint32_t heldMs) {
-    uint8_t pct = (uint8_t)constrain((heldMs * 100UL) / SOS_HOLD_MS, 0UL, 100UL);
-    gDisplay.begin();
-    gDisplay.drawStrRight(0, idBuf);
-    gDisplay.drawStrCenter(14, TXT_HOLD_FOR_SOS);
-    gDisplay.drawProgressBar(14, 30, 100, 14, pct);
-    gDisplay.end();
-}
-
 // ── Button debouncer ──────────────────────────────────────────────────────────
 // (enum BtnEvent declared earlier near top of file)
 
@@ -495,10 +486,6 @@ static BtnEvent checkButton() {
     static uint32_t pressStartMs = 0;
     static uint8_t  clickCount   = 0;
     static uint32_t lastReleaseMs = 0;
-    static bool     holdFired    = false;
-    static uint8_t  holdBeepsFired = 0;   // how many hold-progress beeps fired this press
-    static bool     progressShown  = false; // true once the on-screen hold bar has been drawn this press
-    static uint32_t lastProgressDrawMs = 0;
     // Raw-read debounce state: filters switch contact bounce and brief
     // vibration/movement-induced contact closures (e.g. worn/carried on a
     // moving body) that would otherwise register as real presses and
@@ -506,9 +493,7 @@ static BtnEvent checkButton() {
     static bool     rawDown       = false;
     static uint32_t rawChangeMs   = 0;
 
-    const uint32_t HOLD_MS        = SOS_HOLD_MS;
     const uint32_t CLICK_GAP      = 400;   // max ms between clicks in a multi-click burst
-    const uint32_t PROGRESS_DELAY = 200;   // ms held before showing the bar (avoids flicker on quick clicks)
     const uint32_t DEBOUNCE_MS    = 30;    // raw reading must be stable this long before being trusted
     const uint32_t MIN_PRESS_MS   = 30;    // debounced press must last at least this long to count as a click
 
@@ -525,56 +510,20 @@ static BtnEvent checkButton() {
     if (btnDown && !wasDown) {
         wasDown      = true;
         pressStartMs = millis();
-        holdFired    = false;
-        holdBeepsFired = 0;
-        progressShown  = false;
     }
-    // Live feedback while holding, so the user knows the SOS hold is being
-    // registered and roughly how much longer to keep pressing (helps avoid
-    // releasing too early, or wondering if the button is unresponsive).
-    if (wasDown && btnDown && !holdFired) {
-        uint32_t heldMs = millis() - pressStartMs;
-        if (holdBeepsFired < 1 && heldMs >= 500)  { beepBuzzer(1, 40, 0); holdBeepsFired = 1; }
-        if (holdBeepsFired < 2 && heldMs >= 1000) { beepBuzzer(1, 40, 0); holdBeepsFired = 2; }
-        if (holdBeepsFired < 3 && heldMs >= 1500) { beepBuzzer(2, 40, 40); holdBeepsFired = 3; }
-
-        if (heldMs >= PROGRESS_DELAY && (!progressShown || millis() - lastProgressDrawMs >= 100)) {
-            lastProgressDrawMs = millis();
-            progressShown      = true;
-            showHoldProgress(heldMs);
-        }
-    }
-    // Detect 2-second hold while button is still pressed (fast path).
-    if (wasDown && btnDown && !holdFired && (millis() - pressStartMs >= HOLD_MS)) {
-        holdFired  = true;
-        wasDown    = false;
-        clickCount = 0;
-        return BTN_HOLD_2S;
-    }
-    // Button released — also check for hold on release in case polling was
-    // delayed by a beep (the button may have been released during the block).
+    // Button released.
     if (!btnDown && wasDown) {
         wasDown       = false;
         lastReleaseMs = millis();
         uint32_t heldMs = lastReleaseMs - pressStartMs;
-        if (!holdFired && heldMs >= HOLD_MS) {
-            clickCount = 0;
-            return BTN_HOLD_2S;
-        }
         // Reject presses shorter than MIN_PRESS_MS: a genuine intentional tap
         // holds contact far longer than a momentary vibration/movement
         // jolt, so this filters out accidental clicks without affecting
         // normal use.
-        if (!holdFired && heldMs >= MIN_PRESS_MS) {
+        if (heldMs >= MIN_PRESS_MS) {
             clickCount++;
             beepBuzzer(1, 25, 0);   // immediate tick per click so the user can
                                     // self-correct a multi-click gesture in progress
-        }
-        // Released before the hold completed — restore whatever the screen
-        // showed before we interrupted it with the progress bar.
-        if (progressShown) {
-            progressShown = false;
-            displayHome();
         }
     }
     // Evaluate click burst after the inter-click silence window expires
@@ -638,6 +587,10 @@ void setup() {
     digitalWrite(PIN_BUZZER, LOW);
     pinMode(BUTTON_PIN, INPUT_PULLDOWN);        // active HIGH (per variant.h)
 
+    // Charger status (CHARGE_STA, active LOW -- see variant.h) -- used in
+    // loop() to blink PIN_LED1 while the battery is actively charging.
+    pinMode(EXT_CHRG_DETECT, INPUT_PULLUP);
+
     // GPS — Airoha GNSS enable/reset sequence already ran in initVariant()
     // (before setup()); just start the UART. No MediaTek PMTK constellation
     // command is sent (Airoha does not use the PMTK protocol).
@@ -693,6 +646,50 @@ void loop() {
     if (!setupOK && millis() - lastDiagMs >= 2000UL) {
         lastDiagMs = millis();
         Serial.println("[DIAG] setupOK=false — setup() did not complete");
+    }
+
+    // Charging-status LED blink -- runs unconditionally (even if setupOK is
+    // false) so charging feedback works regardless of CDP/radio state.
+    // EXT_CHRG_DETECT (CHARGE_STA, active LOW -- see variant.h) tells us
+    // when the battery is actively charging; blink PIN_LED1 while it is.
+    {
+        static unsigned long lastChargeBlinkMs = 0;
+        static bool          chargeLedOn       = false;
+        bool charging = (digitalRead(EXT_CHRG_DETECT) == EXT_CHRG_DETECT_VALUE);
+        if (charging) {
+            if (millis() - lastChargeBlinkMs >= 500UL) {
+                lastChargeBlinkMs = millis();
+                chargeLedOn       = !chargeLedOn;
+                digitalWrite(PIN_LED1, chargeLedOn ? HIGH : LOW);
+            }
+        } else if (chargeLedOn) {
+            chargeLedOn = false;
+            digitalWrite(PIN_LED1, LOW);
+        }
+    }
+
+    // GPS-request LED blink -- while a LoRa-originated CMD:GPS_REQUEST is
+    // being serviced (handleGpsRequestCommand() below, including the async
+    // phone-GPS wait/flush pipeline), blink PIN_LED1 faster than the
+    // charging blink so there's a visible "working on it" cue even though
+    // this board has no display. Takes priority over the charging blink
+    // while active since it's a more time-bounded, information-bearing
+    // status; checkButton()'s SOS-hold blink (called later below) still
+    // takes priority over this if both happen to be active at once.
+    if (gpsReqLedActive) {
+        if (gpsReqDeferredSendMs == 0 && gpsReqSentMs == 0 && !gpsTxPending) {
+            // Async pipeline has gone idle -- request fully resolved.
+            gpsReqLedActive = false;
+            digitalWrite(PIN_LED1, LOW);
+        } else {
+            static unsigned long lastGpsReqBlinkMs = 0;
+            static bool          gpsReqLedOn       = false;
+            if (millis() - lastGpsReqBlinkMs >= 220UL) {
+                lastGpsReqBlinkMs = millis();
+                gpsReqLedOn       = !gpsReqLedOn;
+                digitalWrite(PIN_LED1, gpsReqLedOn ? HIGH : LOW);
+            }
+        }
     }
     // Diagnostic: 7 fast blinks at first loop() entry — visible even if setupOK=false.
     static bool loopEntryBlinked = false;
@@ -816,68 +813,6 @@ void loop() {
     // ── Button ────────────────────────────────────────────────────────────────
     BtnEvent btn = checkButton();
 
-    if (btn == BTN_HOLD_2S) {
-        // Hardware-button SOS — request GPS from phone if we don't have a fix.
-        String gpsLat, gpsLng, gpsAlt, gpsSpd, gpsHdg;
-        bool gotGps = false;
-
-        if (tinyGps.location.isValid() && tinyGps.location.age() < 5000) {
-            gpsLat = String(tinyGps.location.lat(), 6);
-            gpsLng = String(tinyGps.location.lng(), 6);
-            if (tinyGps.altitude.isValid()) gpsAlt = String(tinyGps.altitude.meters(), 1);
-            if (tinyGps.speed.isValid())    gpsSpd = String(tinyGps.speed.kmph(), 1);
-            if (tinyGps.course.isValid())   gpsHdg = String(tinyGps.course.deg(), 1);
-            gotGps = true;
-        }
-
-        if (gotGps) {
-            // Already have a local fix — send immediately, no need to wait.
-            dspBegin();
-            dspStrRight(0, idBuf);
-            displayBatt();
-            dspStrCenter(22, TXT_SENDING);
-            dspStrCenter(34, TXT_EMERGENCY_SIGNAL_DOTS);
-            dspEnd();
-            sendEmergency(gpsLat, gpsLng, gpsAlt, gpsSpd, gpsHdg, /* gpsFromPhone= */ false);
-        } else if (phoneGpsLatBuf[0] != '\0') {
-            // We already have a cached phone fix from earlier — use it now.
-            dspBegin();
-            dspStrRight(0, idBuf);
-            displayBatt();
-            dspStrCenter(22, TXT_SENDING);
-            dspStrCenter(34, TXT_EMERGENCY_SIGNAL_DOTS);
-            dspEnd();
-            sendEmergency(String(phoneGpsLatBuf), String(phoneGpsLngBuf),
-                          phoneGpsAltBuf[0] ? String(phoneGpsAltBuf) : "",
-                          phoneGpsSpdBuf[0] ? String(phoneGpsSpdBuf) : "",
-                          phoneGpsHdgBuf[0] ? String(phoneGpsHdgBuf) : "",
-                          /* gpsFromPhone= */ true);
-        } else if (isPhoneConnected()) {
-            // No fix yet — ask the phone and continue asynchronously below
-            // (see "Deferred SOS" block) so we don't block button polling
-            // or duck.run(). Single-click cancels this while it's pending.
-            dspBegin();
-            dspStrRight(0, idBuf);
-            dspStrCenter(22, TXT_REQUESTING_GPS);
-            dspStrCenter(34, TXT_FROM_PHONE_DOTS);
-            dspStrCenter(46, TXT_CLICK_TO_CANCEL);
-            dspEnd();
-            broadcast("CDK:GPSREQ");
-            sosPending     = true;
-            sosWaitStartMs = millis();
-        } else {
-            // No local fix, no phone connected — send anyway, but make sure
-            // the user sees clearly that no location was included.
-            dspBegin();
-            dspStrRight(0, idBuf);
-            displayBatt();
-            dspStrCenter(22, TXT_SENDING);
-            dspStrCenter(34, TXT_EMERGENCY_SIGNAL_DOTS);
-            dspEnd();
-            sendEmergency("", "", "", "", "", /* gpsFromPhone= */ false);
-        }
-    }
-
     if (btn == BTN_SINGLE) {
         if (sosPending) {
             // Cancel a pending SOS that's still waiting on a phone GPS reply.
@@ -901,39 +836,79 @@ void loop() {
             dspPowerSave(0);
             displayHome();
         } else {
-            displayEnabled = !displayEnabled;
-            if (displayEnabled) {
-                dspPowerSave(0);
-                displayHome();
+            // Single-click SOS — request GPS from phone if we don't have a fix.
+            String gpsLat, gpsLng, gpsAlt, gpsSpd, gpsHdg;
+            bool gotGps = false;
+
+            if (tinyGps.location.isValid() && tinyGps.location.age() < 5000) {
+                gpsLat = String(tinyGps.location.lat(), 6);
+                gpsLng = String(tinyGps.location.lng(), 6);
+                if (tinyGps.altitude.isValid()) gpsAlt = String(tinyGps.altitude.meters(), 1);
+                if (tinyGps.speed.isValid())    gpsSpd = String(tinyGps.speed.kmph(), 1);
+                if (tinyGps.course.isValid())   gpsHdg = String(tinyGps.course.deg(), 1);
+                gotGps = true;
+            }
+
+            if (gotGps) {
+                // Already have a local fix — send immediately, no need to wait.
+                dspBegin();
+                dspStrRight(0, idBuf);
+                displayBatt();
+                dspStrCenter(22, TXT_SENDING);
+                dspStrCenter(34, TXT_EMERGENCY_SIGNAL_DOTS);
+                dspEnd();
+                sendEmergency(gpsLat, gpsLng, gpsAlt, gpsSpd, gpsHdg, /* gpsFromPhone= */ false);
+            } else if (phoneGpsLatBuf[0] != '\0') {
+                // We already have a cached phone fix from earlier — use it now.
+                dspBegin();
+                dspStrRight(0, idBuf);
+                displayBatt();
+                dspStrCenter(22, TXT_SENDING);
+                dspStrCenter(34, TXT_EMERGENCY_SIGNAL_DOTS);
+                dspEnd();
+                sendEmergency(String(phoneGpsLatBuf), String(phoneGpsLngBuf),
+                              phoneGpsAltBuf[0] ? String(phoneGpsAltBuf) : "",
+                              phoneGpsSpdBuf[0] ? String(phoneGpsSpdBuf) : "",
+                              phoneGpsHdgBuf[0] ? String(phoneGpsHdgBuf) : "",
+                              /* gpsFromPhone= */ true);
+            } else if (isPhoneConnected()) {
+                // No fix yet — ask the phone and continue asynchronously below
+                // (see "Deferred SOS" block) so we don't block button polling
+                // or duck.run(). Another single-click cancels this while it's pending.
+                dspBegin();
+                dspStrRight(0, idBuf);
+                dspStrCenter(22, TXT_REQUESTING_GPS);
+                dspStrCenter(34, TXT_FROM_PHONE_DOTS);
+                dspStrCenter(46, TXT_CLICK_TO_CANCEL);
+                dspEnd();
+                broadcast("CDK:GPSREQ");
+                sosPending     = true;
+                sosWaitStartMs = millis();
             } else {
-                dspPowerSave(1);
+                // No local fix, no phone connected — send anyway, but make sure
+                // the user sees clearly that no location was included.
+                dspBegin();
+                dspStrRight(0, idBuf);
+                displayBatt();
+                dspStrCenter(22, TXT_SENDING);
+                dspStrCenter(34, TXT_EMERGENCY_SIGNAL_DOTS);
+                dspEnd();
+                sendEmergency("", "", "", "", "", /* gpsFromPhone= */ false);
             }
         }
     }
 
-    // Double-click: Roger acknowledgement — moved from triple-click since
-    // this is the more time-critical rescue-coordination action and
-    // deserves the fewer-clicks slot. The old double-click battery-send
-    // feature was removed: battery is already auto-broadcast on BLE
-    // connect (ble_on_connect()) and periodically over USB, so a manual
-    // send added no information the phone didn't already have.
+    // Double-click: toggle display on/off — moved here now that Roger
+    // acknowledgement (the old double-click action) has been removed and
+    // single-click triggers SOS directly.
     if (btn == BTN_DOUBLE) {
-        // protobuf-encoded StatusMsg wrapped in a StatusReport (same topic,
-        // matching handleMsg()'s phone-composed messages).
-        duckcdp_StatusMsg rogerMsg = duckcdp_StatusMsg_init_zero;
-        rogerMsg.src = duckcdp_StatusMsgSrc_STATUS_MSG_SRC_DEVICE;
-        std::snprintf(rogerMsg.text, sizeof(rogerMsg.text), "Roger");
-        std::vector<uint8_t> rogerEncoded = duckpayload::encodeStatusReportMsg(rogerMsg);
-        sendUplink(topics::status, std::string(reinterpret_cast<const char*>(rogerEncoded.data()), rogerEncoded.size()));
-        broadcast("CDK:ACK,ID:ROGER");
-        dspPowerSave(0);
-        displayEnabled = true;
-        dspBegin();
-        dspStrRight(0, idBuf);
-        dspStrCenter(28, TXT_ROGER_SENT);
-        dspEnd();
-        delay(2000);
-        displayHome();
+        displayEnabled = !displayEnabled;
+        if (displayEnabled) {
+            dspPowerSave(0);
+            displayHome();
+        } else {
+            dspPowerSave(1);
+        }
     }
 
     // Triple-click: GPS/date-time pages — moved from quadruple-click now
@@ -1146,8 +1121,8 @@ void loop() {
     }
 
     // ── Deferred SOS: waiting (non-blocking) for a phone GPS reply ───────────
-    // Triggered from BTN_HOLD_2S above when no local fix was available yet.
-    // Cancelled by a single click (see BTN_SINGLE handling above).
+    // Triggered from BTN_SINGLE above when no local fix was available yet.
+    // Cancelled by another single click (see BTN_SINGLE handling above).
     if (sosPending) {
         if (phoneGpsLatBuf[0] != '\0') {
             sosPending = false;
@@ -1211,6 +1186,11 @@ void loop() {
 // duckcrypto::decryptFromPeer() has verified the request came from
 // whoever holds OpenDMS's static private key.
 void handleGpsRequestCommand() {
+    // Drives the loop()-level LED blink (see loop()) for the whole span of
+    // servicing this request -- cleared below for the two branches that
+    // resolve synchronously, left set for the async phone-GPS-wait branch
+    // so loop() can clear it once that pipeline actually finishes.
+    gpsReqLedActive = true;
     if (!tinyGps.location.isValid()) {
         // No local fix yet -- the GNSS module may be sitting idle (see
         // wakeGnss()'s doc comment). Proactively request a wake right now
@@ -1246,7 +1226,16 @@ void handleGpsRequestCommand() {
         dspStr(0, 40, ("LNG:" + String(tinyGps.location.lng(), 5)).c_str());
         dspEnd();
         sendUplink(topics::gps, std::string(reinterpret_cast<const char*>(encoded.data()), encoded.size()));
-        delay(3000);
+        // Blink the LED through the "sending" confirmation window -- this
+        // path is synchronous/blocking, so toggle it directly here rather
+        // than relying on loop()'s async blink block, which won't run again
+        // until this function returns.
+        for (uint32_t i = 0; i < 3000; i += 200) {
+            digitalWrite(PIN_LED1, (i / 200) % 2 == 0 ? HIGH : LOW);
+            delay(200);
+        }
+        digitalWrite(PIN_LED1, LOW);
+        gpsReqLedActive = false;
         dspPowerSave(1);
     } else {
         bool phoneConnected = isPhoneConnected();
@@ -1277,6 +1266,11 @@ void handleGpsRequestCommand() {
             noGps.rssi_dbm = currentRssiDbm();
             std::vector<uint8_t> encoded = duckpayload::encodeGps(noGps);
             sendUplink(topics::gps, std::string(reinterpret_cast<const char*>(encoded.data()), encoded.size()));
+            // Resolved immediately (no phone to wait on) -- nothing async
+            // left pending, so stop the blink now rather than waiting for
+            // loop() to notice.
+            gpsReqLedActive = false;
+            digitalWrite(PIN_LED1, LOW);
         }
         gpsDisplayClearMs = millis() + 2000;
     }

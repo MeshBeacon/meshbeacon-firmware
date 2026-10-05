@@ -212,13 +212,9 @@ static volatile bool  usbConnectDisplayPending   = false;
 static volatile bool  usbDisconnectDisplayPending= false;
 static volatile bool  sosAckDisplayPending       = false;
 
-// ── SOS state (non-blocking) ─────────────────────────────────────────────────
-// Set when the 2s-hold has fired but we're waiting (asynchronously) on a
-// phone GPS reply before actually transmitting. A single click while this is
-// true cancels the pending SOS (see BTN_SINGLE handling in loop()).
-static bool           sosPending      = false;
-static unsigned long  sosWaitStartMs  = 0;
-const  unsigned long  SOS_GPS_WAIT_MS = 2500UL;
+// ── Power button hold timing ─────────────────────────────────────────────────
+// This is the board's Power button: a 2s hold powers the device off (see
+// BTN_HOLD_2S handling in loop()), it does not send an SOS.
 const  uint32_t       SOS_HOLD_MS     = 2000UL;   // shared with checkButton()'s hold detection
 
 // ── GPS TX payload and phone GPS cache ───────────────────────────────────────
@@ -501,6 +497,19 @@ static int batteryPercent(float vbat) {
     return (int)constrain(pct, 0.0f, 100.0f);
 }
 
+// Logs the battery rail voltage immediately before a LoRa TX attempt. Helps
+// diagnose a report of "shuts down at night, battery still reads charged
+// afterward": during the day the solar panel can supplement a TX current
+// spike (LoRa TX can pull 100+ mA), so the battery itself never has to
+// source the full peak alone; at night it does, and if the pack/BMS sags or
+// cuts off under that transient load it can brownout-reset even though its
+// open-circuit voltage recovers to a "charged"-looking reading afterward.
+// See also the RESETREAS diagnostic in setup().
+static void logVbatBeforeTx(const char* label) {
+    float vbat = readVbat();
+    Serial.printf("[PWR] pre-TX(%s) VBAT=%.3fV (%d%%)\n", label, vbat, batteryPercent(vbat));
+}
+
 // Draw a live progress bar while the SOS button is held, so the user gets
 // clear visual (not just audible) confirmation the hold is registering and
 // can see roughly how much longer is needed. No-op on this board (no
@@ -628,6 +637,30 @@ void setup() {
     // USB serial (debug / phone comms)
     Serial.begin(115200);
 
+    // ── Power-loss / reset-reason diagnostic ────────────────────────────────
+    // Helps determine whether a report of "shuts down at night, battery
+    // still reads charged afterward" is a true brownout/power-loss reset
+    // (RESETREAS reads 0 -- the nRF52 does not distinguish a first power-on
+    // from a brownout reset, both clear this register) vs. our own Power
+    // button's System OFF wake (OFF bit set) vs. a watchdog reset (DOG bit
+    // set). Must read before clearing; clearing uses the standard nRF52
+    // write-the-bits-you-read-back-to-clear-them pattern.
+    {
+        uint32_t resetReas = NRF_POWER->RESETREAS;
+        NRF_POWER->RESETREAS = resetReas; // clear for next boot
+        Serial.printf("[PWR] RESETREAS=0x%08lX%s%s%s%s%s%s%s%s%s\n",
+            (unsigned long)resetReas,
+            (resetReas == 0)                           ? " POWERON_OR_BROWNOUT"  : "",
+            (resetReas & POWER_RESETREAS_RESETPIN_Msk) ? " RESETPIN"             : "",
+            (resetReas & POWER_RESETREAS_DOG_Msk)      ? " WATCHDOG"             : "",
+            (resetReas & POWER_RESETREAS_SREQ_Msk)     ? " SOFT_RESET"           : "",
+            (resetReas & POWER_RESETREAS_LOCKUP_Msk)   ? " CPU_LOCKUP"           : "",
+            (resetReas & POWER_RESETREAS_OFF_Msk)      ? " WAKE_FROM_OFF_GPIO"   : "",
+            (resetReas & POWER_RESETREAS_LPCOMP_Msk)   ? " WAKE_FROM_OFF_LPCOMP" : "",
+            (resetReas & POWER_RESETREAS_NFC_Msk)       ? " WAKE_FROM_OFF_NFC"    : "",
+            (resetReas & POWER_RESETREAS_VBUS_Msk)      ? " WAKE_FROM_OFF_VBUS"   : "");
+    }
+
     // No display on this board -- initDisplay()/dspStatus() are no-ops.
     initDisplay();
     dspStatus("Booting...", DUCK_NAME);
@@ -711,6 +744,14 @@ void setup() {
 
     // Re-configure button — defensive in case BLE/SD peripheral init disturbed it.
     pinMode(CANCEL_BUTTON_PIN, INPUT);
+
+    // Steady "booted and active" indicator. PIN_LED1 is reserved for the
+    // transient BLINK_LED()/loop-entry blink diagnostics above and in
+    // loop(), so PIN_LED2 is used here instead and left solidly lit for as
+    // long as the device is running normally. It is turned back off in the
+    // Power-button handler (BTN_HOLD_2S) right before systemOff(), so "LED2
+    // on" reliably means "powered on and setup() completed successfully".
+    digitalWrite(PIN_LED2, HIGH);
 
     Serial.println(String("CDK:ID,VALUE:") + DUCK_ID_BUF);
     sendBattery();
@@ -844,76 +885,18 @@ void loop() {
     BtnEvent btn = checkButton();
 
     if (btn == BTN_HOLD_2S) {
-        // Hardware-button SOS — request GPS from phone if we don't have a fix.
-        String gpsLat, gpsLng, gpsAlt, gpsSpd, gpsHdg;
-        bool gotGps = false;
-
-        if (tinyGps.location.isValid() && tinyGps.location.age() < 5000) {
-            gpsLat = String(tinyGps.location.lat(), 6);
-            gpsLng = String(tinyGps.location.lng(), 6);
-            if (tinyGps.altitude.isValid()) gpsAlt = String(tinyGps.altitude.meters(), 1);
-            if (tinyGps.speed.isValid())    gpsSpd = String(tinyGps.speed.kmph(), 1);
-            if (tinyGps.course.isValid())   gpsHdg = String(tinyGps.course.deg(), 1);
-            gotGps = true;
-        }
-
-        if (gotGps) {
-            // Already have a local fix — send immediately, no need to wait.
-            dspBegin();
-            dspStrRight(0, idBuf);
-            displayBatt();
-            dspStrCenter(22, TXT_SENDING);
-            dspStrCenter(34, TXT_EMERGENCY_SIGNAL_DOTS);
-            dspEnd();
-            sendEmergency(gpsLat, gpsLng, gpsAlt, gpsSpd, gpsHdg, /* gpsFromPhone= */ false);
-        } else if (phoneGpsLatBuf[0] != '\0') {
-            // We already have a cached phone fix from earlier — use it now.
-            dspBegin();
-            dspStrRight(0, idBuf);
-            displayBatt();
-            dspStrCenter(22, TXT_SENDING);
-            dspStrCenter(34, TXT_EMERGENCY_SIGNAL_DOTS);
-            dspEnd();
-            sendEmergency(String(phoneGpsLatBuf), String(phoneGpsLngBuf),
-                          phoneGpsAltBuf[0] ? String(phoneGpsAltBuf) : "",
-                          phoneGpsSpdBuf[0] ? String(phoneGpsSpdBuf) : "",
-                          phoneGpsHdgBuf[0] ? String(phoneGpsHdgBuf) : "",
-                          /* gpsFromPhone= */ true);
-        } else if (isPhoneConnected()) {
-            // No fix yet — ask the phone and continue asynchronously below
-            // (see "Deferred SOS" block) so we don't block button polling
-            // or duck.run(). Single-click cancels this while it's pending.
-            dspBegin();
-            dspStrRight(0, idBuf);
-            dspStrCenter(22, TXT_REQUESTING_GPS);
-            dspStrCenter(34, TXT_FROM_PHONE_DOTS);
-            dspStrCenter(46, TXT_CLICK_TO_CANCEL);
-            dspEnd();
-            broadcast("CDK:GPSREQ");
-            sosPending     = true;
-            sosWaitStartMs = millis();
-        } else {
-            // No local fix, no phone connected — send anyway, but make sure
-            // the user sees clearly that no location was included.
-            dspBegin();
-            dspStrRight(0, idBuf);
-            displayBatt();
-            dspStrCenter(22, TXT_SENDING);
-            dspStrCenter(34, TXT_EMERGENCY_SIGNAL_DOTS);
-            dspEnd();
-            sendEmergency("", "", "", "", "", /* gpsFromPhone= */ false);
-        }
+        // This is the board's Power button -- a 2s hold powers the device
+        // off (true nRF52 System OFF, lowest power state), it is NOT an SOS
+        // trigger. Pressing the same (active-LOW) button again wakes the
+        // device back up via a full reset/reboot, giving the expected
+        // "press to turn off, press to turn on" behavior.
+        digitalWrite(PIN_LED1, LOW);
+        digitalWrite(PIN_LED2, LOW);
+        systemOff(CANCEL_BUTTON_PIN, 0);   // wake_logic=0: wake on pin LOW
     }
 
     if (btn == BTN_SINGLE) {
-        if (sosPending) {
-            // Cancel a pending SOS that's still waiting on a phone GPS reply.
-            sosPending = false;
-            beepBuzzer(1, 60, 0);
-            dspPowerSave(0);
-            displayEnabled = true;
-            displayHome();
-        } else if (sosAckUntilMs > 0) {
+        if (sosAckUntilMs > 0) {
             sosAckUntilMs = 0;
             dspPowerSave(0);
             displayHome();
@@ -1133,6 +1116,7 @@ void loop() {
     }
 
     // ── Deferred GPS LoRa TX ──────────────────────────────────────────────────
+    if (gpsTxPending) logVbatBeforeTx("GPS");
     if (flushDeferredGpsTx(gpsTxPending, gpsTxPayload, &gpsLoraOk)) {
         Serial.printf("[GPS] Deferred TX %s (%u bytes)\n", gpsLoraOk ? "OK" : "FAILED", (unsigned)gpsTxPayload.size());
     }
@@ -1143,6 +1127,7 @@ void loop() {
         std::string beaconAckWire = meshgroupconfig::isConfigured()
             ? encryptBeaconPayload(TOPIC_BEACON_ACK, beaconAckPayload)
             : std::string(beaconAckPayload);
+        logVbatBeforeTx("BEACON_ACK");
         duck.sendData(TOPIC_BEACON_ACK, beaconAckWire, BROADCAST_DUID);
         Serial.printf("[BEACON] ACK TX: %s\n", beaconAckPayload);
     }
@@ -1151,35 +1136,6 @@ void loop() {
     if (gpsDisplayClearMs > 0 && millis() >= gpsDisplayClearMs) {
         gpsDisplayClearMs = 0;
         dspPowerSave(1);
-    }
-
-    // ── Deferred SOS: waiting (non-blocking) for a phone GPS reply ───────────
-    // Triggered from BTN_HOLD_2S above when no local fix was available yet.
-    // Cancelled by a single click (see BTN_SINGLE handling above).
-    if (sosPending) {
-        if (phoneGpsLatBuf[0] != '\0') {
-            sosPending = false;
-            dspBegin();
-            dspStrRight(0, idBuf);
-            displayBatt();
-            dspStrCenter(22, TXT_SENDING);
-            dspStrCenter(34, TXT_EMERGENCY_SIGNAL_DOTS);
-            dspEnd();
-            sendEmergency(String(phoneGpsLatBuf), String(phoneGpsLngBuf),
-                          phoneGpsAltBuf[0] ? String(phoneGpsAltBuf) : "",
-                          phoneGpsSpdBuf[0] ? String(phoneGpsSpdBuf) : "",
-                          phoneGpsHdgBuf[0] ? String(phoneGpsHdgBuf) : "",
-                          /* gpsFromPhone= */ true);
-        } else if (millis() - sosWaitStartMs >= SOS_GPS_WAIT_MS) {
-            sosPending = false;
-            dspBegin();
-            dspStrRight(0, idBuf);
-            displayBatt();
-            dspStrCenter(22, TXT_SENDING);
-            dspStrCenter(34, TXT_EMERGENCY_SIGNAL_DOTS);
-            dspEnd();
-            sendEmergency("", "", "", "", "", /* gpsFromPhone= */ false);
-        }
     }
 
     // ── Deferred CDK:GPSREQ dispatch ─────────────────────────────────────────
@@ -1793,6 +1749,7 @@ bool sendEmergency(String lat, String lng, String alt, String spd, String hdg, b
     // Fail-safe (not fail-closed) for SOS: falls back to cleartext as a last
     // resort if sealing fails, since dropping an emergency alert is worse
     // than leaking location for this specific flow.
+    logVbatBeforeTx("SOS");
     int failure = sendUplinkSos(topics::alert, std::string(reinterpret_cast<const char*>(encoded.data()), encoded.size()));
     lastTxResult = failure;
     lastTxMs     = millis();
@@ -1893,6 +1850,7 @@ void handleFrame(const String& line) {
             std::string beaconWire = meshgroupconfig::isConfigured()
                 ? encryptBeaconPayload(TOPIC_BEACON, gpsPayload)
                 : std::string(gpsPayload);
+            logVbatBeforeTx("BEACON");
             int beaconResult = duck.sendData(TOPIC_BEACON, beaconWire, BROADCAST_DUID);
             broadcast(beaconResult == 0 ? "CDK:STATUS,SCAN:ping_sent" : "CDK:STATUS,SCAN:ping_failed");
             broadcast("CDK:SCAN_ACK");
