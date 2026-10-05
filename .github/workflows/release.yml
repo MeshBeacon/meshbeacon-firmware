@@ -40,7 +40,7 @@ jobs:
             env: local_t1000e
             example_dir: Basic-Ducks/Seeed/T1000E
             lang_flag: ''
-          - name: solar-p1-pro-MamaDuck
+          - name: solar_p1_pro-MamaDuck
             example_dir: Basic-Ducks/Seeed/SolarP1Pro
             env: local_solar_p1_pro
             lang_flag: ''
