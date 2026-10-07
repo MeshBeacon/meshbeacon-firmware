@@ -55,7 +55,10 @@
 // which inserts all forward-declared function prototypes immediately
 // before the first function definition it finds -- sees this enum before
 // any prototype that returns/takes it (e.g. checkButton() further down).
-enum BtnEvent { BTN_NONE, BTN_SINGLE, BTN_DOUBLE, BTN_TRIPLE, BTN_QUAD };
+// BTN_HOLD_2S: holding the button for 2s triggers power-off (systemOff());
+// pressing the button again wakes the device back up via a full reset (see
+// variant.h BUTTON_PIN / checkButton() / the BTN_HOLD_2S handler in loop()).
+enum BtnEvent { BTN_NONE, BTN_SINGLE, BTN_DOUBLE, BTN_TRIPLE, BTN_QUAD, BTN_HOLD_2S };
 
 // Access the RadioLib radio instance from DuckLoRa.cpp to read RSSI/SNR.
 extern CDPCFG_LORA_CLASS lora;
@@ -296,6 +299,7 @@ void handleRadioRegion(const String& body);
 void handleGpsRequestCommand();
 void blinkLed(int times);
 void beepBuzzer(int times, int onMs = 100, int offMs = 100);
+void playPowerOnMelody();
 bool sendEmergency(String lat = "", String lng = "", String alt = "",
                    String spd = "", String hdg = "", bool gpsFromPhone = false);
 static float readVbat();
@@ -492,10 +496,15 @@ static BtnEvent checkButton() {
     // trigger unintended single/double/triple-click mode changes.
     static bool     rawDown       = false;
     static uint32_t rawChangeMs   = 0;
+    // Suppresses click-counting on release once a 2s-hold power-off event
+    // has already fired for the current press, and prevents BTN_HOLD_2S
+    // from re-firing every subsequent poll while the button stays held.
+    static bool     holdFired     = false;
 
     const uint32_t CLICK_GAP      = 400;   // max ms between clicks in a multi-click burst
     const uint32_t DEBOUNCE_MS    = 30;    // raw reading must be stable this long before being trusted
     const uint32_t MIN_PRESS_MS   = 30;    // debounced press must last at least this long to count as a click
+    const uint32_t HOLD_OFF_MS    = 2000;  // hold duration that triggers power-off (BTN_HOLD_2S)
 
     bool rawNow = (digitalRead(BUTTON_PIN) == HIGH);  // active HIGH (pull-down, per variant.h)
     if (rawNow != rawDown) {
@@ -510,6 +519,12 @@ static BtnEvent checkButton() {
     if (btnDown && !wasDown) {
         wasDown      = true;
         pressStartMs = millis();
+        holdFired    = false;
+    }
+    // Power-off: button still held for HOLD_OFF_MS -- fire once per press.
+    if (btnDown && wasDown && !holdFired && (millis() - pressStartMs >= HOLD_OFF_MS)) {
+        holdFired = true;
+        return BTN_HOLD_2S;
     }
     // Button released.
     if (!btnDown && wasDown) {
@@ -519,8 +534,10 @@ static BtnEvent checkButton() {
         // Reject presses shorter than MIN_PRESS_MS: a genuine intentional tap
         // holds contact far longer than a momentary vibration/movement
         // jolt, so this filters out accidental clicks without affecting
-        // normal use.
-        if (heldMs >= MIN_PRESS_MS) {
+        // normal use. Also reject if a hold-power-off already fired for
+        // this press, so releasing the button afterward doesn't also
+        // register as a click.
+        if (!holdFired && heldMs >= MIN_PRESS_MS) {
             clickCount++;
             beepBuzzer(1, 25, 0);   // immediate tick per click so the user can
                                     // self-correct a multi-click gesture in progress
@@ -586,6 +603,11 @@ void setup() {
     pinMode(PIN_BUZZER,   OUTPUT);              // active HIGH
     digitalWrite(PIN_BUZZER, LOW);
     pinMode(BUTTON_PIN, INPUT_PULLDOWN);        // active HIGH (per variant.h)
+
+    // Power-on chime -- audible confirmation the device has turned on,
+    // whether from a cold boot or waking from System OFF via the
+    // BTN_HOLD_2S power button handler in loop().
+    playPowerOnMelody();
 
     // Charger status (CHARGE_STA, active LOW -- see variant.h) -- used in
     // loop() to blink PIN_LED1 while the battery is actively charging.
@@ -812,6 +834,19 @@ void loop() {
 
     // ── Button ────────────────────────────────────────────────────────────────
     BtnEvent btn = checkButton();
+
+    if (btn == BTN_HOLD_2S) {
+        // Power button: a 2s hold powers the device off (true nRF52 System
+        // OFF, lowest power state). Pressing the same (active-HIGH,
+        // pull-down) button again wakes the device back up via a full
+        // reset/reboot -- setup() runs again from scratch, including the
+        // power-on melody (playPowerOnMelody()), giving the expected
+        // "press to turn off, press to turn on" behavior.
+        beepBuzzer(2, 80, 80);
+        digitalWrite(PIN_LED1, LOW);
+        dspPowerSave(1);
+        systemOff(BUTTON_PIN, 1);   // wake_logic=1: wake on pin HIGH
+    }
 
     if (btn == BTN_SINGLE) {
         if (sosPending) {
@@ -1773,6 +1808,27 @@ void beepBuzzer(int times, int onMs, int offMs) {
         }
     }
     NRF_P0->OUTCLR = (1u << 25);   // ensure buzzer is silent after last beep
+}
+
+// Short ascending power-on chime (C5-E5-G5) on the passive buzzer, built on
+// the same bit-bang approach as beepBuzzer() (safe from any call context,
+// including this early in setup() before timers/FreeRTOS are fully up).
+void playPowerOnMelody() {
+    static const uint16_t NOTE_HZ[] = { 523, 659, 784 };   // C5, E5, G5
+    static const uint16_t NOTE_MS[] = { 90,   90,  140 };
+    NRF_P0->DIRSET = (1u << 25);   // ensure PIN_BUZZER is output
+    for (size_t n = 0; n < sizeof(NOTE_HZ) / sizeof(NOTE_HZ[0]); n++) {
+        uint32_t halfPeriodUs = 500000UL / NOTE_HZ[n];
+        unsigned long endMs = millis() + NOTE_MS[n];
+        while ((long)(endMs - millis()) > 0) {
+            NRF_P0->OUTSET = (1u << 25);
+            delayMicroseconds(halfPeriodUs);
+            NRF_P0->OUTCLR = (1u << 25);
+            delayMicroseconds(halfPeriodUs);
+        }
+        delay(20);   // brief gap between notes
+    }
+    NRF_P0->OUTCLR = (1u << 25);   // ensure buzzer is silent after the chime
 }
 
 // ── Battery ───────────────────────────────────────────────────────────────────
