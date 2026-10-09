@@ -42,7 +42,6 @@
 #include "../../common/PhoneGpsHandler.h"
 #include "../../common/DeferredGpsTx.h"
 #include "../../common/SignalQuality.h"
-#include "security/SecurityEventCounters.h"
 
 // ADC_RESOLUTION is not defined in this board's variant.h; 14-bit gives
 // full-scale 16383 and must match the analogReadResolution(14) call in setup().
@@ -55,10 +54,17 @@
 // which inserts all forward-declared function prototypes immediately
 // before the first function definition it finds -- sees this enum before
 // any prototype that returns/takes it (e.g. checkButton() further down).
-// BTN_HOLD_2S: holding the button for 2s triggers power-off (systemOff());
-// pressing the button again wakes the device back up via a full reset (see
-// variant.h BUTTON_PIN / checkButton() / the BTN_HOLD_2S handler in loop()).
-enum BtnEvent { BTN_NONE, BTN_SINGLE, BTN_DOUBLE, BTN_TRIPLE, BTN_QUAD, BTN_HOLD_2S };
+// BTN_HOLD_POWER: holding the button for HOLD_OFF_MS triggers power-off
+// (systemOff()); pressing the button again wakes the device back up via a
+// full reset (see variant.h BUTTON_PIN / checkButton() / the BTN_HOLD_POWER
+// handler in loop()). The threshold is deliberately long (several seconds,
+// see HOLD_OFF_MS in checkButton()) with an escalating audible warning
+// starting at HOLD_WARN_MS, so that incidental sustained contact (device
+// worn/carried against the body, pressed in a bag/pocket) is very unlikely
+// to power the device off silently -- this is a safety-critical SOS device,
+// so accidental shutdown is far worse than an occasional deliberate
+// long-press being slightly less convenient.
+enum BtnEvent { BTN_NONE, BTN_SINGLE, BTN_DOUBLE, BTN_TRIPLE, BTN_QUAD, BTN_HOLD_POWER };
 
 // Access the RadioLib radio instance from DuckLoRa.cpp to read RSSI/SNR.
 extern CDPCFG_LORA_CLASS lora;
@@ -93,20 +99,36 @@ static char DUCK_ID_BUF[9] = {0};
 #define DUCK_NAME DUCK_ID_BUF   // kept so the rest of this sketch is unchanged
 
 // ── GPS ───────────────────────────────────────────────────────────────────────
+// GPS_ALWAYS_ON: when 1 (default), GPS_RTC_INT is asserted HIGH and left
+// there, so the Airoha GNSS module never drops into its own low-power/
+// RTC-only idle state -- GPS stays continuously warm/ready at the cost of
+// extra battery drain. Set to 0 (e.g. via build_flags = -DGPS_ALWAYS_ON=0)
+// to restore duty-cycled behavior: GPS_RTC_INT is only pulsed (a brief
+// "please wake up" nudge) when the module has gone idle or a GPS location
+// request comes in with no current fix, letting it idle the rest of the
+// time to save power.
+#ifndef GPS_ALWAYS_ON
+#  define GPS_ALWAYS_ON 1
+#endif
+
 static TinyGPSPlus tinyGps;
 static bool gpsModuleDetected = false;
 static bool gpsFix            = false;
 
-// Pulses GPS_RTC_INT ("normal LOW, wake by HIGH" -- see variant.h) to ask the
-// Airoha GNSS module to resume from its own low-power/RTC-only idle state.
-// initVariant() only ever drives this pin LOW once at boot, so without this,
-// nothing ever asks the module to wake back up once it goes idle -- including
-// right when a LoRa-originated GPS location request comes in and needs a
-// fresh fix.
+// Asserts GPS_RTC_INT ("normal LOW, wake by HIGH" -- see variant.h) to ask
+// the Airoha GNSS module to (re)wake from its own low-power/RTC-only idle
+// state. With GPS_ALWAYS_ON (default), the pin is left HIGH permanently
+// instead of being pulsed back down, so the module is continuously told to
+// stay awake rather than being allowed to idle again a few seconds later --
+// see the GPS_ALWAYS_ON doc comment above. With GPS_ALWAYS_ON=0, this is a
+// brief one-shot pulse instead, matching the module's own duty-cycled power
+// saving behavior.
 static void wakeGnss() {
     digitalWrite(GPS_RTC_INT, HIGH);
+#if !GPS_ALWAYS_ON
     delay(10);
     digitalWrite(GPS_RTC_INT, LOW);
+#endif
 }
 
 // ── Display ───────────────────────────────────────────────────────────────────
@@ -253,7 +275,7 @@ static struct { int times; int onMs; int offMs; } gBeepReq = {};
 static unsigned long lastBattMs  = 0;
 
 // ── Per-duck GPS cache ────────────────────────────────────────────────────────
-struct DuckGps { float lat; float lng; unsigned long tsMs; };
+struct DuckGps { float lat; float lng; bool hasFix; bool phoneConnected; unsigned long tsMs; };
 static std::map<String, DuckGps> duckGpsCache;
 constexpr unsigned long DUCK_GPS_TTL_MS = 300000UL;   // 5 minutes
 
@@ -261,7 +283,7 @@ constexpr unsigned long DUCK_GPS_TTL_MS = 300000UL;   // 5 minutes
 static const uint8_t  TOPIC_BEACON      = 0x20;  // 32 -- was 27 (collided with topics::encrypted_cmd=0x1B)
 static const uint8_t  TOPIC_BEACON_ACK  = 0x21;  // 33 -- was 28 (collided with topics::sealed_uplink=0x1C)
 static volatile bool  beaconAckPending  = false;
-static char           beaconAckPayload[80] = {};
+static char           beaconAckPayload[96] = {};
 static unsigned long  beaconAckDeferMs  = 0;
 
 // ── Duck instance ─────────────────────────────────────────────────────────────
@@ -496,15 +518,27 @@ static BtnEvent checkButton() {
     // trigger unintended single/double/triple-click mode changes.
     static bool     rawDown       = false;
     static uint32_t rawChangeMs   = 0;
-    // Suppresses click-counting on release once a 2s-hold power-off event
-    // has already fired for the current press, and prevents BTN_HOLD_2S
+    // Suppresses click-counting on release once a hold power-off event has
+    // already fired for the current press, and prevents BTN_HOLD_POWER
     // from re-firing every subsequent poll while the button stays held.
     static bool     holdFired     = false;
+    // Throttles the escalating warning beep while the hold threshold hasn't
+    // been reached yet (see HOLD_WARN_MS below).
+    static uint32_t lastWarnBeepMs = 0;
 
     const uint32_t CLICK_GAP      = 400;   // max ms between clicks in a multi-click burst
     const uint32_t DEBOUNCE_MS    = 30;    // raw reading must be stable this long before being trusted
     const uint32_t MIN_PRESS_MS   = 30;    // debounced press must last at least this long to count as a click
-    const uint32_t HOLD_OFF_MS    = 2000;  // hold duration that triggers power-off (BTN_HOLD_2S)
+    // Power-off requires a deliberately long, continuous hold -- NOT just 2s
+    // -- because this device is carried/worn and incidental sustained
+    // contact (pressed against the body, a strap, or inside a bag) for a
+    // couple of seconds is plausible and must never silently power the
+    // device off (which would also silently eat the user's next SOS
+    // button press as a wake-up instead of an actual SOS send). An audible
+    // escalating warning starts at HOLD_WARN_MS so any accidental hold is
+    // noticeable well before it reaches HOLD_OFF_MS and actually commits.
+    const uint32_t HOLD_WARN_MS   = 2000;  // warning beeps start here
+    const uint32_t HOLD_OFF_MS    = 4000;  // hold duration that triggers power-off (BTN_HOLD_POWER)
 
     bool rawNow = (digitalRead(BUTTON_PIN) == HIGH);  // active HIGH (pull-down, per variant.h)
     if (rawNow != rawDown) {
@@ -517,14 +551,26 @@ static BtnEvent checkButton() {
     }
 
     if (btnDown && !wasDown) {
-        wasDown      = true;
-        pressStartMs = millis();
-        holdFired    = false;
+        wasDown       = true;
+        pressStartMs  = millis();
+        holdFired     = false;
+        lastWarnBeepMs = 0;
     }
-    // Power-off: button still held for HOLD_OFF_MS -- fire once per press.
-    if (btnDown && wasDown && !holdFired && (millis() - pressStartMs >= HOLD_OFF_MS)) {
-        holdFired = true;
-        return BTN_HOLD_2S;
+    // Escalating warning beep while held past HOLD_WARN_MS but before the
+    // power-off threshold -- gives a clear, repeated audible cue (not just
+    // a single easy-to-miss beep) that continuing to hold will power the
+    // device off, so an accidental hold can be noticed and released.
+    if (btnDown && wasDown && !holdFired) {
+        uint32_t heldSoFar = millis() - pressStartMs;
+        if (heldSoFar >= HOLD_WARN_MS && millis() - lastWarnBeepMs >= 250) {
+            lastWarnBeepMs = millis();
+            beepBuzzer(1, 15, 0);
+        }
+        // Power-off: button still held for HOLD_OFF_MS -- fire once per press.
+        if (heldSoFar >= HOLD_OFF_MS) {
+            holdFired = true;
+            return BTN_HOLD_POWER;
+        }
     }
     // Button released.
     if (!btnDown && wasDown) {
@@ -606,7 +652,7 @@ void setup() {
 
     // Power-on chime -- audible confirmation the device has turned on,
     // whether from a cold boot or waking from System OFF via the
-    // BTN_HOLD_2S power button handler in loop().
+    // BTN_HOLD_POWER power button handler in loop().
     playPowerOnMelody();
 
     // Charger status (CHARGE_STA, active LOW -- see variant.h) -- used in
@@ -617,6 +663,12 @@ void setup() {
     // (before setup()); just start the UART. No MediaTek PMTK constellation
     // command is sent (Airoha does not use the PMTK protocol).
     Serial1.begin(GPS_BAUDRATE);
+
+    // Keep GPS always on (GPS_ALWAYS_ON, default 1): assert GPS_RTC_INT
+    // right away rather than waiting for the idle watchdog in loop() to
+    // notice the module has gone quiet and re-request a wake. See
+    // wakeGnss()'s doc comment. Harmless no-op nudge when GPS_ALWAYS_ON=0.
+    wakeGnss();
 
     // initDisplay() + dspStatus("Booting...") were moved to before the Serial
     // wait at the top of setup() so the display always shows content on boot.
@@ -833,18 +885,40 @@ void loop() {
     }
 
     // ── Button ────────────────────────────────────────────────────────────────
+    // Set once BTN_HOLD_POWER fires; cleared once systemOff() actually runs.
+    // See the non-blocking release check right after the button dispatch.
+    static bool pendingPowerOff = false;
     BtnEvent btn = checkButton();
 
-    if (btn == BTN_HOLD_2S) {
-        // Power button: a 2s hold powers the device off (true nRF52 System
-        // OFF, lowest power state). Pressing the same (active-HIGH,
-        // pull-down) button again wakes the device back up via a full
+    if (btn == BTN_HOLD_POWER) {
+        // Power button: a long (several-second) hold ARMS power-off (true
+        // nRF52 System OFF, lowest power state) -- see HOLD_OFF_MS /
+        // HOLD_WARN_MS in checkButton() for why this requires a deliberate
+        // hold rather than a quick 2s touch. The device does not actually
+        // enter System OFF here -- see the non-blocking check just below,
+        // which waits for the button to be released first. Pressing the
+        // button again (once off) wakes the device back up via a full
         // reset/reboot -- setup() runs again from scratch, including the
         // power-on melody (playPowerOnMelody()), giving the expected
         // "press to turn off, press to turn on" behavior.
         beepBuzzer(2, 80, 80);
         digitalWrite(PIN_LED1, LOW);
         dspPowerSave(1);
+        pendingPowerOff = true;
+    }
+
+    // Finish powering off only once the button has actually been released.
+    // systemOff(BUTTON_PIN, 1) arms a wake-on-HIGH GPIO SENSE condition --
+    // calling it while the pin still reads HIGH (i.e. still held, which is
+    // guaranteed true the instant BTN_HOLD_POWER fires above) means the
+    // wake condition is already satisfied before the chip ever properly
+    // settles into System OFF, so it never reliably sleeps/wakes again.
+    // Checking this non-blockingly on every loop() iteration (instead of a
+    // blocking busy-wait) also avoids starving duck.run()/LoRa servicing
+    // while waiting for release -- a busy-wait here previously froze LoRa
+    // (and anything else driven from loop()) for however long it ran.
+    if (pendingPowerOff && digitalRead(BUTTON_PIN) == LOW) {
+        pendingPowerOff = false;
         systemOff(BUTTON_PIN, 1);   // wake_logic=1: wake on pin HIGH
     }
 
@@ -1034,24 +1108,7 @@ void loop() {
         }
     }
 
-    // Periodic fail-closed rejection-count report, every 5 min, only when
-    // there's something to report (see SecurityEventCounters.h) -- lets an
-    // operator tell "keys are fine, we're blocking forged traffic" apart
-    // from "our own config/key is broken and legitimate traffic is being
-    // silently dropped", without ever trusting the rejected data itself.
-    // Uses the existing plaintext topics::status uplink (already relayed
-    // and stored as-is by MeshBeacon Ops), so no new wire format or
-    // server-side changes are needed.
-    {
-        static unsigned long lastSecEventsReportMs = 0;
-        if (millis() - lastSecEventsReportMs >= 300000UL) {
-            lastSecEventsReportMs = millis();
-            if (securityevents::hasEvents()) {
-                sendUplink(topics::status, securityevents::summary());
-                securityevents::reset();
-            }
-        }
-    }
+
 
     while (Serial.available()) {
         lastUsbRxMs = millis();
@@ -1112,16 +1169,19 @@ void loop() {
                       tinyGps.location.lat(), tinyGps.location.lng(),
                       tinyGps.satellites.value());
     }
-    // GPS idle watchdog: GPS_RTC_INT is documented ("normal LOW, wake by
-    // HIGH" -- see variant.h) as the wake-request line for the Airoha GNSS
-    // module, but initVariant() only ever drives it LOW once at boot and
-    // nothing else asserts it again. Once the module goes idle on its own
-    // and stops streaming NMEA, re-pulse this pin to ask it to resume.
+    // GPS always-on watchdog: GPS_RTC_INT is documented ("normal LOW, wake
+    // by HIGH" -- see variant.h) as the wake-request line for the Airoha
+    // GNSS module. With GPS_ALWAYS_ON (default), wakeGnss() asserts it HIGH
+    // and leaves it there, and setup() already asserts it once at boot --
+    // this periodic re-assert is just a defensive safety net in case the
+    // line ever gets pulled back down. With GPS_ALWAYS_ON=0, this is the
+    // primary mechanism that re-wakes the module once it's gone idle on its
+    // own and stopped streaming NMEA.
     if (gpsModuleDetected
         && millis() - lastGpsByteMs >= GPS_IDLE_WAKE_MS
         && millis() - lastGpsWakeMs >= GPS_IDLE_WAKE_MS) {
         lastGpsWakeMs = millis();
-        Serial.println("[GPS] Idle watchdog: pulsing GPS_RTC_INT to request wake");
+        Serial.println("[GPS] Always-on watchdog: re-asserting GPS_RTC_INT");
         wakeGnss();
     }
 
@@ -1311,6 +1371,36 @@ void handleGpsRequestCommand() {
     }
 }
 
+// ── MTALK de-dup (avoid re-displaying resent retries) ─────────────────────
+// The mobile app's bounded auto-retry resends the same MTALK mid if it
+// hasn't seen our CDK:MACK receipt in time -- this usually means ITS COPY of
+// our ack was lost/delayed, not that the message itself failed to arrive.
+// Without this check, every such retry gets displayed again as a brand-new
+// incoming message (duplicate bubbles on the receiving device). Track the
+// last few (senderId, mid) pairs already delivered to the app and suppress
+// re-broadcasting duplicates seen within the window, while still re-sending
+// the ACK so the sender's retry loop can resolve.
+#define MTALK_DEDUP_SIZE 8
+#define MTALK_DEDUP_WINDOW_MS 60000UL
+static String mtalkSeenKeys[MTALK_DEDUP_SIZE];
+static unsigned long mtalkSeenTimes[MTALK_DEDUP_SIZE];
+static uint8_t mtalkSeenNext = 0;
+
+static bool isDuplicateMTalk(const String& senderId, const String& mid) {
+    if (mid.length() == 0) return false; // no mid, can't de-dup -- treat as new
+    String key = senderId + ":" + mid;
+    unsigned long now = millis();
+    for (uint8_t i = 0; i < MTALK_DEDUP_SIZE; i++) {
+        if (mtalkSeenKeys[i] == key && (now - mtalkSeenTimes[i]) < MTALK_DEDUP_WINDOW_MS) {
+            return true;
+        }
+    }
+    mtalkSeenKeys[mtalkSeenNext] = key;
+    mtalkSeenTimes[mtalkSeenNext] = now;
+    mtalkSeenNext = (mtalkSeenNext + 1) % MTALK_DEDUP_SIZE;
+    return false;
+}
+
 // ── handleDuckData ────────────────────────────────────────────────────────────
 void handleDuckData(CdpPacket packet) {
     bool isForMe    = (memcmp(packet.dduid.data(), duck.getDuckId().data(), 8) == 0);
@@ -1349,16 +1439,25 @@ void handleDuckData(CdpPacket packet) {
         }
         int latIdx = pdata.indexOf("LAT:");
         int lngIdx = pdata.indexOf("LNG:");
+        int phoneIdx = pdata.indexOf("PHONE:");
+        bool phoneKnown = phoneIdx >= 0;
+        bool phoneConnected = phoneKnown && pdata.charAt(phoneIdx + 6) == '1';
+        bool gotFix = false;
+        float lat = 0, lng = 0;
         if (latIdx >= 0 && lngIdx >= 0) {
             int latEnd = pdata.indexOf(',', latIdx + 4);
             int lngEnd = pdata.indexOf(',', lngIdx + 4);
-            float lat = pdata.substring(latIdx + 4, latEnd < 0 ? (int)pdata.length() : latEnd).toFloat();
-            float lng = pdata.substring(lngIdx + 4, lngEnd < 0 ? (int)pdata.length() : lngEnd).toFloat();
-            if (!(lat == 0.0f && lng == 0.0f)) {
-                char _buf9[9]; memcpy(_buf9, packet.sduid.data(), 8); _buf9[8] = 0;
-                String sid(_buf9);
-                duckGpsCache[sid] = { lat, lng, millis() };
-            }
+            lat = pdata.substring(latIdx + 4, latEnd < 0 ? (int)pdata.length() : latEnd).toFloat();
+            lng = pdata.substring(lngIdx + 4, lngEnd < 0 ? (int)pdata.length() : lngEnd).toFloat();
+            gotFix = !(lat == 0.0f && lng == 0.0f);
+        }
+        if (gotFix || phoneKnown) {
+            char _buf9[9]; memcpy(_buf9, packet.sduid.data(), 8); _buf9[8] = 0;
+            String sid(_buf9);
+            DuckGps& entry = duckGpsCache[sid];
+            if (gotFix) { entry.lat = lat; entry.lng = lng; entry.hasFix = true; }
+            if (phoneKnown) { entry.phoneConnected = phoneConnected; }
+            entry.tsMs = millis();
         }
     }
 
@@ -1377,18 +1476,20 @@ void handleDuckData(CdpPacket packet) {
         sid.trim();
         if (sid.length() > 0 && sid != String((const char*)duck.getDuckId().data())) {
             auto gpsIt = duckGpsCache.find(sid);
-            if (gpsIt != duckGpsCache.end() && millis() - gpsIt->second.tsMs < DUCK_GPS_TTL_MS) {
-                char seenBuf[80];
-                snprintf(seenBuf, sizeof(seenBuf), "CDK:SEEN,ID:%.8s,TYPE:%s,LAT:%.6f,LNG:%.6f",
+            bool fresh = gpsIt != duckGpsCache.end() && millis() - gpsIt->second.tsMs < DUCK_GPS_TTL_MS;
+            char seenBuf[96];
+            if (fresh && gpsIt->second.hasFix) {
+                snprintf(seenBuf, sizeof(seenBuf), "CDK:SEEN,ID:%.8s,TYPE:%s,LAT:%.6f,LNG:%.6f,PHONE:%d",
                          (char*)packet.sduid.data(), typeStr,
-                         gpsIt->second.lat, gpsIt->second.lng);
-                broadcast(seenBuf);
+                         gpsIt->second.lat, gpsIt->second.lng, gpsIt->second.phoneConnected ? 1 : 0);
+            } else if (fresh) {
+                snprintf(seenBuf, sizeof(seenBuf), "CDK:SEEN,ID:%.8s,TYPE:%s,PHONE:%d",
+                         (char*)packet.sduid.data(), typeStr, gpsIt->second.phoneConnected ? 1 : 0);
             } else {
-                char seenBuf[48];
                 snprintf(seenBuf, sizeof(seenBuf), "CDK:SEEN,ID:%.8s,TYPE:%s",
                          (char*)packet.sduid.data(), typeStr);
-                broadcast(seenBuf);
             }
+            broadcast(seenBuf);
         }
     }
 
@@ -1549,7 +1650,6 @@ void handleDuckData(CdpPacket packet) {
             bool broadcastAuthenticated = verifyBroadcastMac(24, packet.data, verifiedBroadcast);
             if (meshgroupconfig::isConfigured() && !broadcastAuthenticated) {
                 logerr_ln("BROADCAST (topic 24) received but mesh group key is configured (authentication required) and MAC verification failed, dropping.");
-                securityevents::recordBroadcastRejected();
                 break;
             }
             String broadcastText;
@@ -1622,9 +1722,11 @@ void handleDuckData(CdpPacket packet) {
               } else {
                 // Incoming message.
                 String text = String(mtalk.text);
-                String frameOut = "CDK:MTALK,TEXT:" + text + ",FROM:" + senderId;
-                if (mid.length() > 0) frameOut += ",MID:" + mid;
-                broadcast(frameOut);
+                if (!isDuplicateMTalk(senderId, mid)) {
+                  String frameOut = "CDK:MTALK,TEXT:" + text + ",FROM:" + senderId;
+                  if (mid.length() > 0) frameOut += ",MID:" + mid;
+                  broadcast(frameOut);
+                }
                 // Send targeted delivery receipt back to the original sender.
                 if (mid.length() > 0) {
                   std::array<uint8_t, 8> senderDuid;
@@ -1676,21 +1778,21 @@ void handleDuckData(CdpPacket packet) {
         case TOPIC_BEACON: {
             if (meshgroupconfig::isConfigured() && !beaconAuthenticated) {
                 logerr_ln("TOPIC_BEACON received but mesh group key is configured (encryption required), dropping.");
-                securityevents::recordBeaconRejected();
                 break;
             }
             if (memcmp(packet.sduid.data(), duck.getDuckId().data(), 8) == 0) break;
             if (!beaconAckPending && !gpsTxPending) {
-                char ownGps[80] = {};
+                char ownGps[96] = {};
+                bool linked = isPhoneConnected();
                 if (tinyGps.location.isValid() && tinyGps.location.age() < 30000) {
-                    snprintf(ownGps, sizeof(ownGps), "GPS,LAT:%.6f,LNG:%.6f",
-                             tinyGps.location.lat(), tinyGps.location.lng());
+                    snprintf(ownGps, sizeof(ownGps), "GPS,LAT:%.6f,LNG:%.6f,PHONE:%d",
+                             tinyGps.location.lat(), tinyGps.location.lng(), linked ? 1 : 0);
                 } else if (phoneGpsLatBuf[0] != '\0') {
-                    snprintf(ownGps, sizeof(ownGps), "GPS,LAT:%s,LNG:%s",
-                             phoneGpsLatBuf, phoneGpsLngBuf);
+                    snprintf(ownGps, sizeof(ownGps), "GPS,LAT:%s,LNG:%s,PHONE:%d",
+                             phoneGpsLatBuf, phoneGpsLngBuf, linked ? 1 : 0);
                 } else {
-                    strncpy(ownGps, "GPS,FIX:0", sizeof(ownGps) - 1);
-                    if (isPhoneConnected() && gpsReqDeferredSendMs == 0)
+                    snprintf(ownGps, sizeof(ownGps), "GPS,FIX:0,PHONE:%d", linked ? 1 : 0);
+                    if (linked && gpsReqDeferredSendMs == 0)
                         gpsReqDeferredSendMs = millis() + 300;
                 }
                 strncpy(beaconAckPayload, ownGps, sizeof(beaconAckPayload) - 1);
@@ -1702,7 +1804,6 @@ void handleDuckData(CdpPacket packet) {
         case TOPIC_BEACON_ACK:
             if (meshgroupconfig::isConfigured() && !beaconAuthenticated) {
                 logerr_ln("TOPIC_BEACON_ACK received but mesh group key is configured (encryption required), dropping.");
-                securityevents::recordBeaconRejected();
                 break;
             }
             if (memcmp(packet.sduid.data(), duck.getDuckId().data(), 8) == 0) break;
@@ -1943,16 +2044,17 @@ void handleFrame(const String& line) {
         case FT_GPS:   handleGps(body);   break;
         case FT_RADIOREGION: handleRadioRegion(body); break;
         case FT_SCAN: {
-            char gpsPayload[80] = {};
+            char gpsPayload[96] = {};
+            bool linked = isPhoneConnected();
             if (tinyGps.location.isValid() && tinyGps.location.age() < 30000) {
-                snprintf(gpsPayload, sizeof(gpsPayload), "GPS,LAT:%.6f,LNG:%.6f",
-                         tinyGps.location.lat(), tinyGps.location.lng());
+                snprintf(gpsPayload, sizeof(gpsPayload), "GPS,LAT:%.6f,LNG:%.6f,PHONE:%d",
+                         tinyGps.location.lat(), tinyGps.location.lng(), linked ? 1 : 0);
             } else if (phoneGpsLatBuf[0] != '\0') {
-                snprintf(gpsPayload, sizeof(gpsPayload), "GPS,LAT:%s,LNG:%s",
-                         phoneGpsLatBuf, phoneGpsLngBuf);
+                snprintf(gpsPayload, sizeof(gpsPayload), "GPS,LAT:%s,LNG:%s,PHONE:%d",
+                         phoneGpsLatBuf, phoneGpsLngBuf, linked ? 1 : 0);
             } else {
-                strncpy(gpsPayload, "GPS,FIX:0", sizeof(gpsPayload) - 1);
-                if (isPhoneConnected() && gpsReqDeferredSendMs == 0 && gpsReqSentMs == 0)
+                snprintf(gpsPayload, sizeof(gpsPayload), "GPS,FIX:0,PHONE:%d", linked ? 1 : 0);
+                if (linked && gpsReqDeferredSendMs == 0 && gpsReqSentMs == 0)
                     gpsReqDeferredSendMs = millis() + 300;
             }
             std::string beaconWire = meshgroupconfig::isConfigured()
