@@ -29,6 +29,7 @@ CDPCFG_LORA_CLASS lora = new Module(CDPCFG_PIN_LORA_CS, CDPCFG_PIN_LORA_DIO0,
 
 volatile uint16_t DuckLoRa::interruptFlags = 0;
 volatile bool DuckLoRa::receivedFlag = false;
+volatile bool DuckLoRa::txBusy = false;
 
 LoRaConfigParams DuckLoRa::defaultRadioParams = {
     /* band     = */ CDPCFG_RF_LORA_FREQ,
@@ -397,6 +398,7 @@ void DuckLoRa::serviceInterruptFlags() {
         if (DuckLoRa::interruptFlags & RADIOLIB_SX126X_IRQ_TX_DONE ) {
             loginfo_ln("SX1262 Interrupt flag was set: payload transmission complete");
             lora.finishTransmit();
+            txBusy = false;
             lora.setFrequency(defaultRadioParams.band); // restore mesh channel
             goToReceiveMode(false);
         }
@@ -424,6 +426,7 @@ void DuckLoRa::serviceInterruptFlags() {
         if (DuckLoRa::interruptFlags & RADIOLIB_LR11X0_IRQ_TX_DONE ) {
             loginfo_ln("LR1110 Interrupt flag was set: payload transmission complete");
             lora.finishTransmit();
+            txBusy = false;
             lora.setFrequency(defaultRadioParams.band); // restore mesh channel
             goToReceiveMode(false);
         }
@@ -451,6 +454,7 @@ void DuckLoRa::serviceInterruptFlags() {
         }
         if (DuckLoRa::interruptFlags & RADIOLIB_SX127X_CLEAR_IRQ_FLAG_TX_DONE) {
             loginfo_ln("SX127x Interrupt flag was set: payload transmission complete");
+            txBusy = false;
             lora.setFrequency(defaultRadioParams.band); // restore mesh channel
             goToReceiveMode(false); // go back to receive mode and reset the receive flag
         }
@@ -482,11 +486,34 @@ int DuckLoRa::startTransmitData(uint8_t* data, int length) {
         return DUCKLORA_ERR_NOT_INITIALIZED;
     }
 
+    // This is a single half-duplex radio -- only one physical transmission
+    // can be in flight at a time. Some call sites issue two sendData()
+    // calls back to back with no intervening wait (e.g. UplinkRouter.h's
+    // sendMamaLink(), which fires announceIdentity() immediately followed
+    // by sendEncryptedData() the first time it talks to a given peer each
+    // boot). Without waiting here, the second startTransmit() below would
+    // hit the radio while it's still actively driving the PA for the first
+    // packet -- corrupting both packets and yanking the PA into an
+    // undefined state mid-transmit, a much bigger instantaneous current
+    // transient than two cleanly sequential transmissions, and a plausible
+    // brownout trigger. Bounded wait so a stuck txBusy (e.g. a missed
+    // TX_DONE IRQ) can't hang the caller forever.
+    unsigned long waitStart = millis();
+    while (txBusy && (millis() - waitStart) < 2000) {
+        vTaskDelay(1);
+    }
+    if (txBusy) {
+        logerr_ln("ERROR startTransmitData: radio still busy after 2s wait, proceeding anyway");
+    }
+
     loginfo_ln("TX data");
     logdbg_ln(" -> len: %d, %s", length, duckutils::toString(data, length).c_str());
 
     long t1 = millis();
-    // non blocking transmit
+    // non blocking transmit -- mark the radio busy BEFORE issuing it so
+    // nothing else can start a second transmit while this one is still
+    // physically going out over the air (see isTransmitting()'s doc comment).
+    txBusy = true;
     tx_err = lora.startTransmit(data, length);
     switch (tx_err) {
         case RADIOLIB_ERR_NONE:

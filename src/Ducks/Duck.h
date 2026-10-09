@@ -42,6 +42,27 @@ class Duck {
      */
     void run(){
       duckRadio.serviceInterruptFlags();
+      if (pendingRreqActive_ && !duckRadio.isTransmitting()) {
+        // The directed send that triggered this RREQ has now finished
+        // physically transmitting (TX_DONE serviced above), so it's safe
+        // to start the RREQ's own transmit without colliding with it.
+        // Don't fire it the instant the radio frees up though -- back-to-
+        // back TX bursts (data packet immediately followed by the RREQ)
+        // stack two LoRa PA current spikes with almost no gap, which can
+        // brown out a marginal power rail (seen on both USB and battery).
+        // Give the supply a short settle window first.
+        if (!pendingRreqArmed_) {
+          pendingRreqArmed_ = true;
+          pendingRreqFireAtMs_ = millis() + RREQ_SETTLE_DELAY_MS;
+        } else if (millis() >= pendingRreqFireAtMs_) {
+          pendingRreqActive_ = false;
+          pendingRreqArmed_ = false;
+          loginfo_ln("[DUCK] Radio free, sending deferred RREQ now (after settle delay).");
+          RouteJSON rreqDoc = RouteJSON(pendingRreqTarget_, this->duid);
+          rreqDoc.addToPath(this->duid);
+          sendRouteRequest(pendingRreqTarget_, rreqDoc);
+        }
+      }
       Duck::logIfLowMemory();
       opendmsconfig::checkSerialProvisioning();
       meshgroupconfig::checkSerialProvisioning();
@@ -122,11 +143,22 @@ class Duck {
         err = sendToRadio(txPacket);
         if(!nextHop.has_value() && txPacket.dduid != PAPADUCK_DUID && txPacket.dduid != BROADCAST_DUID){
             if((millis() - this->lastRreqTime) > 30000){
-              loginfo_ln("[DUCK] Destination not in table, also sending RREQ to learn a route.");
-              RouteJSON rreqDoc = RouteJSON(txPacket.dduid, this->duid);
-              rreqDoc.addToPath(this->duid);
-              sendRouteRequest(txPacket.dduid, rreqDoc);
               this->lastRreqTime = millis();
+              if (duckRadio.isTransmitting()) {
+                // The packet we just handed to sendToRadio() above is still
+                // physically transmitting (startTransmitData() is
+                // non-blocking) -- starting the RREQ's transmit now would
+                // abort/corrupt it on this single half-duplex radio. Defer
+                // it; run() will send it once the radio reports free again.
+                loginfo_ln("[DUCK] Destination not in table, deferring RREQ until radio is free.");
+                pendingRreqTarget_ = txPacket.dduid;
+                pendingRreqActive_ = true;
+              } else {
+                loginfo_ln("[DUCK] Destination not in table, also sending RREQ to learn a route.");
+                RouteJSON rreqDoc = RouteJSON(txPacket.dduid, this->duid);
+                rreqDoc.addToPath(this->duid);
+                sendRouteRequest(txPacket.dduid, rreqDoc);
+              }
             }
         }
       }
@@ -161,11 +193,19 @@ class Duck {
         err = sendToRadio(txPacket);
         if(!nextHop.has_value() && txPacket.dduid != PAPADUCK_DUID && txPacket.dduid != BROADCAST_DUID){
             if((millis() - this->lastRreqTime) > 30000){
-              loginfo_ln("[DUCK] Destination not in table, also sending RREQ to learn a route.");
-              RouteJSON rreqDoc = RouteJSON(txPacket.dduid, this->duid);
-              rreqDoc.addToPath(this->duid);
-              sendRouteRequest(txPacket.dduid, rreqDoc);
               this->lastRreqTime = millis();
+              if (duckRadio.isTransmitting()) {
+                // See the std::string overload above for why this must be
+                // deferred rather than fired immediately.
+                loginfo_ln("[DUCK] Destination not in table, deferring RREQ until radio is free.");
+                pendingRreqTarget_ = txPacket.dduid;
+                pendingRreqActive_ = true;
+              } else {
+                loginfo_ln("[DUCK] Destination not in table, also sending RREQ to learn a route.");
+                RouteJSON rreqDoc = RouteJSON(txPacket.dduid, this->duid);
+                rreqDoc.addToPath(this->duid);
+                sendRouteRequest(txPacket.dduid, rreqDoc);
+              }
             }
         }
       }
@@ -394,6 +434,26 @@ class Duck {
     }
 
     /**
+     * @brief Whether this Duck has already learned a peer's long-term
+     * X25519 public key (via a received identity_announce -- see
+     * learnPeerIdentity()). sendEncryptedData()/sendMamaLink() consult the
+     * same underlying cache internally and silently fall back to
+     * plaintext if it returns false, so this exists purely as a read-only
+     * pre-flight check: callers (e.g. UplinkRouter.h's proactive
+     * announce-on-chat-open, or the phone app wanting to show a
+     * "not secure yet" banner) can ask whether a peer is ready for
+     * encrypted MTALK traffic without attempting a send. A freshly-booted
+     * peer -- or one this Duck has never exchanged identities with --
+     * always returns false until the TOFU identity_announce round trip
+     * completes.
+     * @param peerDuid the peer Duck's DUID to check.
+     * @returns true if a public key is already cached for this peer.
+     */
+    bool hasPeerIdentity(Duid peerDuid) {
+      return getPeerIdentity(peerDuid).has_value();
+    }
+
+    /**
      * @brief Get the duck's unique ID.
      * 
      * @returns A byte vector representing the duck's unique ID
@@ -556,11 +616,19 @@ class Duck {
       err = sendToRadio(txPacket);
       if (!nextHop.has_value() && txPacket.dduid != PAPADUCK_DUID && txPacket.dduid != BROADCAST_DUID) {
         if ((millis() - this->lastRreqTime) > 30000) {
-          loginfo_ln("[DUCK] Destination not in table, also sending RREQ to learn a route.");
-          RouteJSON rreqDoc = RouteJSON(txPacket.dduid, this->duid);
-          rreqDoc.addToPath(this->duid);
-          sendRouteRequest(txPacket.dduid, rreqDoc);
           this->lastRreqTime = millis();
+          if (duckRadio.isTransmitting()) {
+            // See sendData()'s std::string overload for why this must be
+            // deferred rather than fired immediately.
+            loginfo_ln("[DUCK] Destination not in table, deferring RREQ until radio is free.");
+            pendingRreqTarget_ = txPacket.dduid;
+            pendingRreqActive_ = true;
+          } else {
+            loginfo_ln("[DUCK] Destination not in table, also sending RREQ to learn a route.");
+            RouteJSON rreqDoc = RouteJSON(txPacket.dduid, this->duid);
+            rreqDoc.addToPath(this->duid);
+            sendRouteRequest(txPacket.dduid, rreqDoc);
+          }
         }
       }
       return err;
@@ -679,6 +747,26 @@ class Duck {
     }
 
     unsigned long lastRreqTime = 0L;
+
+    /**
+     * @brief Set when a directed send (sendData()/routeAndSend()) finds no
+     * cached route and the auto-RREQ that would normally follow it has to
+     * be deferred because the radio is still transmitting the packet we
+     * just queued (see those call sites). startTransmitData() is
+     * non-blocking, so starting the RREQ's transmit immediately would abort
+     * the in-flight packet on this single half-duplex radio -- run() below
+     * sends the deferred RREQ instead, once duckRadio.isTransmitting()
+     * reports the radio is free again.
+     */
+    bool pendingRreqActive_ = false;
+    Duid pendingRreqTarget_{};
+
+    // See run()'s pendingRreqActive_ handling above: once the radio frees
+    // up, wait this long before actually transmitting the deferred RREQ so
+    // its current spike doesn't land right on top of the data packet's.
+    static constexpr unsigned long RREQ_SETTLE_DELAY_MS = 250;
+    bool pendingRreqArmed_ = false;
+    unsigned long pendingRreqFireAtMs_ = 0;
 
     /**
      * @brief Set up USB serial port
