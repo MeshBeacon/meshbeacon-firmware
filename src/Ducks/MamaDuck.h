@@ -6,7 +6,6 @@
 #include "../utils/MemoryFree.h"
 #include "../security/DuckCrypto.h"
 #include "../security/OpenDmsConfig.h"
-#include "../security/SecurityEventCounters.h"
 
 template <typename WifiCapability = DuckWifiNone, typename RadioType = DuckLoRa>
 class MamaDuck : public Duck<WifiCapability, RadioType> {
@@ -313,7 +312,6 @@ private :
                                                       plaintext.data());
                 if (rc != DUCK_ERR_NONE) {
                     logerr_ln("encrypted_cmd decrypt failed rc = %d, dropping (auth failed or corrupt).", rc);
-                    securityevents::recordEncryptedCmdRejected();
                     if (++consecutiveEncryptedCmdFailures_ >= ENCRYPTED_CMD_FAILURE_REANNOUNCE_THRESHOLD) {
                         logerr_ln("encrypted_cmd: %u consecutive decrypt failures, re-announcing identity in case of key drift.",
                                   (unsigned)consecutiveEncryptedCmdFailures_);
