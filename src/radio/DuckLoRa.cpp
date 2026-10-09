@@ -194,7 +194,18 @@ std::optional<std::vector<uint8_t>> DuckLoRa::readReceivedData() { //return a st
     if (packet_length < MIN_PACKET_LENGTH) {
         logerr_ln("ERROR  handlePacket rx data size invalid: %d", packet_length);
 
-        rxState = goToReceiveMode(true); // go back to receive mode and reset the receive flag
+        // Go back to receive mode and reset the receive flag, then bail out
+        // immediately. Falling through here used to proceed with a
+        // zero/undersized packet_length: packetBytes.resize(packet_length)
+        // produces an empty vector whose data() is not safely dereferenceable,
+        // and the later `&data[DATA_POS]` / `&data[packet_length]` pointer
+        // arithmetic forms a reversed (first > last) range that is undefined
+        // behavior when passed to std::vector::insert (it underflows to a
+        // huge size_t distance), causing a silent crash/heap corruption with
+        // no further log output. Always discard undersized/corrupt packets
+        // here instead of processing them.
+        goToReceiveMode(true);
+        return std::nullopt;
     }
 
     loginfo_ln("readReceivedData() - packet length returns: %d", packet_length);
