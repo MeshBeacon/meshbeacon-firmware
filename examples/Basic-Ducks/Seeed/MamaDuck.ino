@@ -792,6 +792,36 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
   }
  }
 
+// ── MTALK de-dup (avoid re-displaying resent retries) ─────────────────────
+// The mobile app's bounded auto-retry resends the same MTALK mid if it
+// hasn't seen our CDK:MACK receipt in time -- this usually means ITS COPY of
+// our ack was lost/delayed, not that the message itself failed to arrive.
+// Without this check, every such retry gets displayed again as a brand-new
+// incoming message (duplicate bubbles on the receiving device). Track the
+// last few (senderId, mid) pairs already delivered to the app and suppress
+// re-broadcasting duplicates seen within the window, while still re-sending
+// the ACK so the sender's retry loop can resolve.
+#define MTALK_DEDUP_SIZE 8
+#define MTALK_DEDUP_WINDOW_MS 60000UL
+static String mtalkSeenKeys[MTALK_DEDUP_SIZE];
+static unsigned long mtalkSeenTimes[MTALK_DEDUP_SIZE];
+static uint8_t mtalkSeenNext = 0;
+
+static bool isDuplicateMTalk(const String& senderId, const String& mid) {
+    if (mid.length() == 0) return false; // no mid, can't de-dup -- treat as new
+    String key = senderId + ":" + mid;
+    unsigned long now = millis();
+    for (uint8_t i = 0; i < MTALK_DEDUP_SIZE; i++) {
+        if (mtalkSeenKeys[i] == key && (now - mtalkSeenTimes[i]) < MTALK_DEDUP_WINDOW_MS) {
+            return true;
+        }
+    }
+    mtalkSeenKeys[mtalkSeenNext] = key;
+    mtalkSeenTimes[mtalkSeenNext] = now;
+    mtalkSeenNext = (mtalkSeenNext + 1) % MTALK_DEDUP_SIZE;
+    return false;
+}
+
  void handleDuckData(CdpPacket packet) {
     bool isForMe = (memcmp(packet.dduid.data(), duck.getDuckId().data(), 8) == 0);
     bool isBroadcast = (packet.dduid[0] == 0xFF);
@@ -1005,9 +1035,13 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
                 // Incoming message.
                 String text = String(mtalk.text);
                 Serial.println("[MTALK] Received: " + text);
-                String frameOut = "CDK:MTALK,TEXT:" + text + ",FROM:" + senderId;
-                if (mid.length() > 0) frameOut += ",MID:" + mid;
-                broadcast(frameOut);
+                if (!isDuplicateMTalk(senderId, mid)) {
+                  String frameOut = "CDK:MTALK,TEXT:" + text + ",FROM:" + senderId;
+                  if (mid.length() > 0) frameOut += ",MID:" + mid;
+                  broadcast(frameOut);
+                } else {
+                  Serial.println("[MTALK] Duplicate retry mid=" + mid + ", suppressing re-broadcast");
+                }
                 // Send targeted delivery receipt back to the original sender.
                 if (mid.length() > 0) {
                   std::array<uint8_t, 8> senderDuid;
