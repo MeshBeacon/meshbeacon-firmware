@@ -132,6 +132,24 @@ int DuckLoRa::setupRadio(const LoRaConfigParams &config) {
         logerr_ln("ERROR  output power is invalid");
         return DUCKLORA_ERR_SETUP;
     }
+#if defined(CDPCFG_RADIO_SX1262) || defined(CDPCFG_RADIO_LR1110)
+    // Use the DC-DC regulator (lower current draw than the LDO default) and
+    // enable RX boosted gain mode. Neither is applied automatically by
+    // begin() -- RadioLib only re-applies boosted gain in resetAGC() "if it
+    // was configured", confirming it defaults off (power-saving gain) on
+    // both SX126x and LR11x0 until explicitly enabled here. Boosted gain
+    // improves weak-signal/marginal-SNR sensitivity at the cost of a small
+    // increase in RX current draw -- matches meshtastic's LR11x0Interface
+    // and SX126xInterface setup for these radio families.
+    rc = lora.setRegulatorDCDC();
+    if (rc != RADIOLIB_ERR_NONE) {
+        logerr_ln("ERROR  failed to set DC-DC regulator mode: %d", rc);
+    }
+    rc = lora.setRxBoostedGainMode(true);
+    if (rc != RADIOLIB_ERR_NONE) {
+        logerr_ln("ERROR  failed to enable RX boosted gain mode: %d", rc);
+    }
+#endif
 #if defined(CDPCFG_RADIO_SX1262)
     // set the interrupt handler to execute when packet tx or rx is done.
     lora.setDio1Action(config.func);
@@ -305,6 +323,17 @@ int DuckLoRa::startReceive()
         logerr_ln("ERROR  LoRa radio not setup");
         return DUCKLORA_ERR_NOT_INITIALIZED;
     }
+#if defined(CDPCFG_RADIO_SX1262) || defined(CDPCFG_RADIO_LR1110)
+    // Re-apply preamble length before every RX re-arm. Meshtastic's RadioLib-based
+    // drivers for these same chip families (LR11x0/LR20x0/SX126x) independently carry
+    // this exact workaround with the comment "Solve RX ack fail after direct message
+    // sent. Not sure why this is needed." -- i.e. something about these chips'
+    // internal state after a TX can leave the RX preamble detector out of sync unless
+    // it's explicitly re-pushed on every startReceive(). Value matches the preamble
+    // length RadioLib's begin() already establishes by default (8 symbols), so this
+    // changes no behavior other than defending against that reset.
+    lora.setPreambleLength(8);
+#endif
     int state = lora.startReceive();
 
     if (state != RADIOLIB_ERR_NONE) {
