@@ -123,8 +123,18 @@ void ifNotBroadcast(CdpPacket rxPacket, int err, bool relay = false) {
             Duid lastInPath = last.has_value() ? last.value() : rxPacket.sduid;
             if(!relay) {
                 loginfo_ln("handleReceivedPacket: Sending RREP");
+                // Append ourselves to the path BEFORE converting/sending so the
+                // original requester's lastInPath (computed from this RREP's
+                // path) resolves to US, not to itself -- otherwise the
+                // requester's routing table ends up with a self-referential
+                // entry. Also learn the route back to the requester now: the
+                // RREQ reached us directly over the air, so (mirroring the
+                // broadcast-RREQ handler in ifBroadcast()) we can only be one
+                // hop away from it.
+                rreqDoc.addToPath(this->duid);
                 rxPacket.data = duckutils::stringToByteVector(rreqDoc.convertReqToRep());
                 this->sendRouteResponse(lastInPath, rreqDoc.asString());
+                this->router.insertIntoRoutingTable(rxPacket.sduid, rxPacket.sduid, this->getSignalScore());
             } else {
                 rxPacket.data = duckutils::stringToByteVector(rreqDoc.addToPath(this->duid)); //why is this different from stringToArray
                 err = this->forwardPacket(rxPacket);
