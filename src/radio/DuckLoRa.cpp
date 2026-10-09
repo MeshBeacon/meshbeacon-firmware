@@ -31,6 +31,18 @@ volatile uint16_t DuckLoRa::interruptFlags = 0;
 volatile bool DuckLoRa::receivedFlag = false;
 volatile bool DuckLoRa::txBusy = false;
 
+// ---- TEMPORARY DIAGNOSTIC INSTRUMENTATION --------------------------------
+// Tracks what frequency we last *told* the radio to use, and how long gaps
+// between serviceInterruptFlags() calls (i.e. duck.run() calls) are, so we
+// can correlate MTALK reception failures with (a) the radio being parked
+// off the mesh frequency by the uplink-channel-spreading mechanism and/or
+// (b) loop() being blocked long enough to starve servicing. Safe to remove
+// once the root cause is confirmed.
+static float s_diagLastFreq = 0.0f;
+static unsigned long s_diagLastServiceMs = 0;
+static bool s_diagServiceMsInit = false;
+// ---------------------------------------------------------------------
+
 LoRaConfigParams DuckLoRa::defaultRadioParams = {
     /* band     = */ CDPCFG_RF_LORA_FREQ,
     /* txPower  = */ CDPCFG_RF_LORA_TXPOW,
@@ -183,6 +195,11 @@ int DuckLoRa::setupRadio(const LoRaConfigParams &config) {
         logerr_ln("ERROR Failed to start receive");
         return DUCKLORA_ERR_RECEIVE;
     }
+
+    s_diagLastFreq = config.band;
+    s_diagLastServiceMs = millis();
+    s_diagServiceMsInit = true;
+    loginfo_ln("[DIAG] radio setup: mesh frequency %.3f MHz", config.band);
 
     loginfo_ln("LoRa radio setup complete");
     isSetup = true;
@@ -377,6 +394,8 @@ int DuckLoRa::setUplinkFrequency(float freqMHz) {
         logerr_ln("ERROR  setUplinkFrequency failed, freq = %f, rc = %d", freqMHz, rc);
         return DUCKLORA_ERR_SETUP;
     }
+    s_diagLastFreq = freqMHz;
+    loginfo_ln("[DIAG] spread to uplink frequency %.3f MHz at t=%lu ms (mesh=%.3f)", freqMHz, millis(), defaultRadioParams.band);
     return DUCK_ERR_NONE;
 }
 
@@ -410,6 +429,14 @@ int DuckLoRa::sleep()
 }
 
 void DuckLoRa::serviceInterruptFlags() {
+    if (s_diagServiceMsInit) {
+        unsigned long nowMs = millis();
+        unsigned long gap = nowMs - s_diagLastServiceMs;
+        if (gap > 250) {
+            loginfo_ln("[DIAG] duck.run() gap was %lu ms (last freq told to radio: %.3f MHz)", gap, s_diagLastFreq);
+        }
+        s_diagLastServiceMs = nowMs;
+    }
     if (DuckLoRa::interruptFlags != 0) {
 
 #ifdef CDPCFG_RADIO_SX1262
@@ -440,6 +467,8 @@ void DuckLoRa::serviceInterruptFlags() {
             lora.finishTransmit();
             txBusy = false;
             lora.setFrequency(defaultRadioParams.band); // restore mesh channel
+            s_diagLastFreq = defaultRadioParams.band;
+            loginfo_ln("[DIAG] TX_DONE restored mesh frequency %.3f MHz at t=%lu ms", defaultRadioParams.band, millis());
             goToReceiveMode(false);
         }
         if (DuckLoRa::interruptFlags & RADIOLIB_SX126X_IRQ_TIMEOUT ) {
@@ -468,6 +497,8 @@ void DuckLoRa::serviceInterruptFlags() {
             lora.finishTransmit();
             txBusy = false;
             lora.setFrequency(defaultRadioParams.band); // restore mesh channel
+            s_diagLastFreq = defaultRadioParams.band;
+            loginfo_ln("[DIAG] TX_DONE restored mesh frequency %.3f MHz at t=%lu ms", defaultRadioParams.band, millis());
             goToReceiveMode(false);
         }
         if (DuckLoRa::interruptFlags & RADIOLIB_LR11X0_IRQ_TIMEOUT ) {
