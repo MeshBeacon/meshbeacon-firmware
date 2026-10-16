@@ -6,7 +6,6 @@
 #include "../utils/MemoryFree.h"
 #include "../security/DuckCrypto.h"
 #include "../security/OpenDmsConfig.h"
-#include "../security/SecurityEventCounters.h"
 
 template <typename WifiCapability = DuckWifiNone, typename RadioType = DuckLoRa>
 class MamaDuck : public Duck<WifiCapability, RadioType> {
@@ -197,8 +196,18 @@ private :
                 Duid lastInPath = last.has_value() ? last.value() : rxPacket.sduid;
                 if(!relay) {
                     loginfo_ln("handleReceivedPacket: Sending RREP");
+                    // Append ourselves to the path BEFORE converting/sending so the
+                    // original requester's lastInPath (computed from this RREP's
+                    // path) resolves to US, not to itself -- otherwise the
+                    // requester's routing table ends up with a self-referential
+                    // entry. Also learn the route back to the requester now: the
+                    // RREQ reached us directly over the air, so (mirroring the
+                    // broadcast-RREQ handler in ifBroadcast()) we can only be one
+                    // hop away from it.
+                    rreqDoc.addToPath(this->duid);
                     rxPacket.data = duckutils::stringToByteVector(rreqDoc.convertReqToRep());
                     this->sendRouteResponse(lastInPath, rreqDoc.asString());
+                    this->router.insertIntoRoutingTable(rxPacket.sduid, rxPacket.sduid, this->getSignalScore());
                 } else {
                     rxPacket.data = duckutils::stringToByteVector(rreqDoc.addToPath(this->duid)); //why is this different from stringToArray
                     err = this->forwardPacket(rxPacket);
@@ -303,7 +312,6 @@ private :
                                                       plaintext.data());
                 if (rc != DUCK_ERR_NONE) {
                     logerr_ln("encrypted_cmd decrypt failed rc = %d, dropping (auth failed or corrupt).", rc);
-                    securityevents::recordEncryptedCmdRejected();
                     if (++consecutiveEncryptedCmdFailures_ >= ENCRYPTED_CMD_FAILURE_REANNOUNCE_THRESHOLD) {
                         logerr_ln("encrypted_cmd: %u consecutive decrypt failures, re-announcing identity in case of key drift.",
                                   (unsigned)consecutiveEncryptedCmdFailures_);

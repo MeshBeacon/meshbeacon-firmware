@@ -129,6 +129,24 @@ class DuckLoRa {
         static bool getReceiveFlag() { return receivedFlag; }
 
         /**
+         * @brief Whether a packet transmission is currently in flight.
+         *
+         * startTransmitData() is non-blocking: it hands the packet to the
+         * radio and returns almost immediately, well before the actual
+         * over-the-air transmission (which can take tens to hundreds of ms)
+         * has completed. Starting a *second* transmit while the first is
+         * still in flight aborts/corrupts it on this single half-duplex
+         * radio -- see Duck.h's deferred-RREQ logic, which uses this to
+         * avoid self-colliding with a packet it just started sending.
+         * Cleared by serviceInterruptFlags() once the TX_DONE interrupt for
+         * the in-flight transmission has been serviced.
+         *
+         * @return true if a transmission has been started but TX_DONE has
+         * not yet been serviced, false if the radio is free to transmit.
+         */
+        static bool isTransmitting() { return txBusy; }
+
+        /**
          * @brief Get the current RSSI value.
          *
          * @returns A float representing the rssi value.
@@ -168,6 +186,7 @@ class DuckLoRa {
     private:
         static volatile uint16_t interruptFlags;
         static volatile bool receivedFlag;
+        static volatile bool txBusy;
         volatile bool isSetup = false;
         unsigned long lastReceiveTime = 0L;
 

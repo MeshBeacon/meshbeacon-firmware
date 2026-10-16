@@ -29,7 +29,6 @@
  #include "../common/PhoneGpsHandler.h"
  #include "../common/DeferredGpsTx.h"
  #include "../common/SignalQuality.h"
- #include "security/SecurityEventCounters.h"
  #ifdef SERIAL_PORT_USBVIRTUAL
  #define Serial SERIAL_PORT_USBVIRTUAL
  #endif
@@ -242,7 +241,7 @@ const  uint32_t       SOS_HOLD_MS       = 2000UL;   // matches button.pressedFor
 // ── Per-duck GPS cache ────────────────────────────────────────────────────────
 // Populated whenever a packet containing LAT:/LNG: fields arrives from any duck.
 // Entries are valid for 5 minutes (same TTL as the app's Nearby Ducks list).
-struct DuckGps { float lat; float lng; unsigned long tsMs; };
+struct DuckGps { float lat; float lng; bool hasFix; bool phoneConnected; unsigned long tsMs; };
 static std::map<String, DuckGps> duckGpsCache;  // key: 8-char duck ID
 constexpr unsigned long DUCK_GPS_TTL_MS = 300000UL;  // 5 minutes
 
@@ -254,7 +253,7 @@ constexpr unsigned long DUCK_GPS_TTL_MS = 300000UL;  // 5 minutes
 static const uint8_t TOPIC_BEACON     = 0x20;  // 32 -- was 27 (collided with topics::encrypted_cmd=0x1B)
 static const uint8_t TOPIC_BEACON_ACK = 0x21;  // 33 -- was 28 (collided with topics::sealed_uplink=0x1C)
 static volatile bool beaconAckPending = false;   // deferred BEACON_ACK TX
-static char          beaconAckPayload[80] = {};   // GPS payload for beacon ACK
+static char          beaconAckPayload[96] = {};   // GPS payload for beacon ACK
 
 // encryptBeaconPayload()/decryptBeaconPayload()/verifyBroadcastMac() now
 // live in examples/Basic-Ducks/common/BeaconCrypto.h (shared with
@@ -972,22 +971,6 @@ class TxCallbacks : public NimBLECharacteristicCallbacks {
     lastIdentityAnnounceMs = millis();
   }
 
-  // Periodic fail-closed rejection-count report, every 5 min, only when
-  // there's something to report (see SecurityEventCounters.h) -- lets an
-  // operator tell "keys are fine, we're blocking forged traffic" apart
-  // from "our own config/key is broken and legitimate traffic is being
-  // silently dropped", without ever trusting the rejected data itself.
-  // Uses the existing plaintext topics::status uplink (already relayed
-  // and stored as-is by MeshBeacon Ops), so no new wire format or
-  // server-side changes are needed.
-  static unsigned long lastSecEventsReportMs = 0;
-  if (millis() - lastSecEventsReportMs >= 300000UL) {
-    lastSecEventsReportMs = millis();
-    if (securityevents::hasEvents()) {
-      sendUplink(topics::status, securityevents::summary());
-      securityevents::reset();
-    }
-  }
   delay(5);
 
 #ifdef ARDUINO_heltec_wifi_lora_32_V4
@@ -1088,6 +1071,36 @@ class TxCallbacks : public NimBLECharacteristicCallbacks {
   }
  }
 
+// ── MTALK de-dup (avoid re-displaying resent retries) ─────────────────────
+// The mobile app's bounded auto-retry resends the same MTALK mid if it
+// hasn't seen our CDK:MACK receipt in time -- this usually means ITS COPY of
+// our ack was lost/delayed, not that the message itself failed to arrive.
+// Without this check, every such retry gets displayed again as a brand-new
+// incoming message (duplicate bubbles on the receiving device). Track the
+// last few (senderId, mid) pairs already delivered to the app and suppress
+// re-broadcasting duplicates seen within the window, while still re-sending
+// the ACK so the sender's retry loop can resolve.
+#define MTALK_DEDUP_SIZE 8
+#define MTALK_DEDUP_WINDOW_MS 60000UL
+static String mtalkSeenKeys[MTALK_DEDUP_SIZE];
+static unsigned long mtalkSeenTimes[MTALK_DEDUP_SIZE];
+static uint8_t mtalkSeenNext = 0;
+
+static bool isDuplicateMTalk(const String& senderId, const String& mid) {
+    if (mid.length() == 0) return false; // no mid, can't de-dup -- treat as new
+    String key = senderId + ":" + mid;
+    unsigned long now = millis();
+    for (uint8_t i = 0; i < MTALK_DEDUP_SIZE; i++) {
+        if (mtalkSeenKeys[i] == key && (now - mtalkSeenTimes[i]) < MTALK_DEDUP_WINDOW_MS) {
+            return true;
+        }
+    }
+    mtalkSeenKeys[mtalkSeenNext] = key;
+    mtalkSeenTimes[mtalkSeenNext] = now;
+    mtalkSeenNext = (mtalkSeenNext + 1) % MTALK_DEDUP_SIZE;
+    return false;
+}
+
  void handleDuckData(CdpPacket packet) {
     bool isForMe = (memcmp(packet.dduid.data(), duck.getDuckId().data(), 8) == 0);
     bool isBroadcast = (packet.dduid[0] == 0xFF);
@@ -1129,22 +1142,34 @@ class TxCallbacks : public NimBLECharacteristicCallbacks {
                       packet.topic, (char*)packet.sduid.data(), pdata.c_str());
         int latIdx = pdata.indexOf("LAT:");
         int lngIdx = pdata.indexOf("LNG:");
+        int phoneIdx = pdata.indexOf("PHONE:");
+        bool phoneKnown = phoneIdx >= 0;
+        bool phoneConnected = phoneKnown && pdata.charAt(phoneIdx + 6) == '1';
+        bool gotFix = false;
+        float lat = 0, lng = 0;
         if (latIdx >= 0 && lngIdx >= 0) {
             int latEnd = pdata.indexOf(',', latIdx + 4);
             int lngEnd = pdata.indexOf(',', lngIdx + 4);
-            float lat = pdata.substring(latIdx + 4, latEnd < 0 ? (int)pdata.length() : latEnd).toFloat();
-            float lng = pdata.substring(lngIdx + 4, lngEnd < 0 ? (int)pdata.length() : lngEnd).toFloat();
+            lat = pdata.substring(latIdx + 4, latEnd < 0 ? (int)pdata.length() : latEnd).toFloat();
+            lng = pdata.substring(lngIdx + 4, lngEnd < 0 ? (int)pdata.length() : lngEnd).toFloat();
             // Skip null-island (0,0) which indicates a missing fix
-            if (!(lat == 0.0f && lng == 0.0f)) {
-                String sid((char*)packet.sduid.data(), 8);
-                duckGpsCache[sid] = { lat, lng, millis() };
-                Serial.printf("[RX-GPS] Cached GPS for %.8s: lat=%.6f lng=%.6f\n",
-                              (char*)packet.sduid.data(), lat, lng);
-            } else {
+            gotFix = !(lat == 0.0f && lng == 0.0f);
+            if (!gotFix) {
                 Serial.println("[RX-GPS] Skipped GPS: null-island (0,0)");
             }
         } else {
             Serial.printf("[RX-GPS] No LAT/LNG in payload (topic=%u)\n", packet.topic);
+        }
+        if (gotFix || phoneKnown) {
+            String sid((char*)packet.sduid.data(), 8);
+            DuckGps& entry = duckGpsCache[sid];
+            if (gotFix) {
+                entry.lat = lat; entry.lng = lng; entry.hasFix = true;
+                Serial.printf("[RX-GPS] Cached GPS for %.8s: lat=%.6f lng=%.6f\n",
+                              (char*)packet.sduid.data(), lat, lng);
+            }
+            if (phoneKnown) { entry.phoneConnected = phoneConnected; }
+            entry.tsMs = millis();
         }
     }
 
@@ -1165,20 +1190,24 @@ class TxCallbacks : public NimBLECharacteristicCallbacks {
         if (sid.length() > 0 && sid != String((char*)duck.getDuckId().data(), 8).c_str()) {
             // Don't report ourselves
             auto gpsIt = duckGpsCache.find(sid);
-            if (gpsIt != duckGpsCache.end() && millis() - gpsIt->second.tsMs < DUCK_GPS_TTL_MS) {
-                char seenBuf[80];
-                snprintf(seenBuf, sizeof(seenBuf), "CDK:SEEN,ID:%.8s,TYPE:%s,LAT:%.6f,LNG:%.6f",
-                         (char*)packet.sduid.data(), typeStr, gpsIt->second.lat, gpsIt->second.lng);
+            bool fresh = gpsIt != duckGpsCache.end() && millis() - gpsIt->second.tsMs < DUCK_GPS_TTL_MS;
+            char seenBuf[96];
+            if (fresh && gpsIt->second.hasFix) {
+                snprintf(seenBuf, sizeof(seenBuf), "CDK:SEEN,ID:%.8s,TYPE:%s,LAT:%.6f,LNG:%.6f,PHONE:%d",
+                         (char*)packet.sduid.data(), typeStr, gpsIt->second.lat, gpsIt->second.lng,
+                         gpsIt->second.phoneConnected ? 1 : 0);
                 Serial.printf("[SEEN] Emitting with GPS: %s\n", seenBuf);
-                broadcast(seenBuf);
+            } else if (fresh) {
+                snprintf(seenBuf, sizeof(seenBuf), "CDK:SEEN,ID:%.8s,TYPE:%s,PHONE:%d",
+                         (char*)packet.sduid.data(), typeStr, gpsIt->second.phoneConnected ? 1 : 0);
+                Serial.printf("[SEEN] Emitting without GPS (phone known): %s\n", seenBuf);
             } else {
-                char seenBuf[48];
                 snprintf(seenBuf, sizeof(seenBuf), "CDK:SEEN,ID:%.8s,TYPE:%s",
                          (char*)packet.sduid.data(), typeStr);
                 Serial.printf("[SEEN] Emitting without GPS (cache %s): %s\n",
                               gpsIt != duckGpsCache.end() ? "expired" : "miss", seenBuf);
-                broadcast(seenBuf);
             }
+            broadcast(seenBuf);
         } else {
             Serial.printf("[SEEN] Skipped: sid='%s' (self or empty)\n", sid.c_str());
         }
@@ -1355,7 +1384,6 @@ class TxCallbacks : public NimBLECharacteristicCallbacks {
             bool broadcastAuthenticated = verifyBroadcastMac(24, packet.data, verifiedBroadcast);
             if (meshgroupconfig::isConfigured() && !broadcastAuthenticated) {
                 Serial.println("[BCAST] BROADCAST (topic 24) received but mesh group key is configured (authentication required) and MAC verification failed, dropping.");
-                securityevents::recordBroadcastRejected();
                 break;
             }
             String broadcastText;
@@ -1536,7 +1564,6 @@ class TxCallbacks : public NimBLECharacteristicCallbacks {
         case TOPIC_BEACON: {  // 27 — combined discovery + GPS beacon
             if (meshgroupconfig::isConfigured() && !beaconAuthenticated) {
                 Serial.println("[BEACON] Mesh group key configured but BEACON not authenticated, dropping (no ACK).");
-                securityevents::recordBeaconRejected();
                 break;
             }
             // GPS coordinates were already extracted into duckGpsCache in
@@ -1558,20 +1585,21 @@ class TxCallbacks : public NimBLECharacteristicCallbacks {
             Serial.printf("[BEACON] Received from %.8s — preparing ACK\n",
                           (char*)packet.sduid.data());
             if (!beaconAckPending && !gpsTxPending) {
-                char ownGps[80] = {};
+                char ownGps[96] = {};
+                bool linked = isPhoneConnected();
 #ifdef ARDUINO_heltec_wifi_lora_32_V4
                 if (tinyGps.location.isValid() && tinyGps.location.age() < 30000) {
-                    snprintf(ownGps, sizeof(ownGps), "GPS,LAT:%.6f,LNG:%.6f",
-                             tinyGps.location.lat(), tinyGps.location.lng());
+                    snprintf(ownGps, sizeof(ownGps), "GPS,LAT:%.6f,LNG:%.6f,PHONE:%d",
+                             tinyGps.location.lat(), tinyGps.location.lng(), linked ? 1 : 0);
                 } else
 #endif
                 if (phoneGpsLatBuf[0] != '\0') {
-                    snprintf(ownGps, sizeof(ownGps), "GPS,LAT:%s,LNG:%s",
-                             phoneGpsLatBuf, phoneGpsLngBuf);
+                    snprintf(ownGps, sizeof(ownGps), "GPS,LAT:%s,LNG:%s,PHONE:%d",
+                             phoneGpsLatBuf, phoneGpsLngBuf, linked ? 1 : 0);
                 } else {
-                    strncpy(ownGps, "GPS,FIX:0", sizeof(ownGps) - 1);
+                    snprintf(ownGps, sizeof(ownGps), "GPS,FIX:0,PHONE:%d", linked ? 1 : 0);
                     Serial.println("[BEACON] No GPS for ACK — requesting from phone (deferred)");
-                    if (isPhoneConnected() && gpsReqDeferredSendMs == 0) {
+                    if (linked && gpsReqDeferredSendMs == 0) {
                         gpsReqDeferredSendMs = millis() + 300;
                     }
                 }
@@ -1588,7 +1616,6 @@ class TxCallbacks : public NimBLECharacteristicCallbacks {
         case TOPIC_BEACON_ACK: {  // 28 — reply to our beacon
             if (meshgroupconfig::isConfigured() && !beaconAuthenticated) {
                 Serial.println("[BEACON] Mesh group key configured but BEACON_ACK not authenticated, dropping.");
-                securityevents::recordBeaconRejected();
                 break;
             }
             // GPS already extracted in section 1 → duckGpsCache updated.
@@ -1604,10 +1631,13 @@ class TxCallbacks : public NimBLECharacteristicCallbacks {
         }
 
         case 26:  // MamaDuck-to-MamaDuck (MTALK)
-            if (duck.isMamaLinkEncryptionEnabled() && !packet.wasAuthenticated) {
-                Serial.println("[MTALK] Packet was not authenticated (encrypted_data), dropping -- encryption is enabled for this build.");
-                break;
-            }
+            // Fail-open (mirrors sendMamaLink()'s send-side cleartext
+            // fallback in UplinkRouter.h): MTALK prioritizes delivery over
+            // confidentiality, so an unauthenticated/plaintext MTALK is
+            // still accepted even when encryption is enabled for this
+            // build -- e.g. the very first message to/from a peer whose
+            // identity key hasn't been exchanged yet would otherwise be
+            // silently dropped.
             if (duckpayload::isProtobuf(packet.data.data(), packet.data.size())) {
               // ── Protobuf-encoded MTalk (see duck_payloads.proto) ─────────
               duckcdp_MTalk mtalk = duckcdp_MTalk_init_zero;
@@ -1625,9 +1655,13 @@ class TxCallbacks : public NimBLECharacteristicCallbacks {
                 // Incoming message.
                 String text = String(mtalk.text);
                 Serial.println("[MTALK] Received: " + text);
-                String frameOut = "CDK:MTALK,TEXT:" + text + ",FROM:" + senderId;
-                if (mid.length() > 0) frameOut += ",MID:" + mid;
-                broadcast(frameOut);
+                if (!isDuplicateMTalk(senderId, mid)) {
+                  String frameOut = "CDK:MTALK,TEXT:" + text + ",FROM:" + senderId;
+                  if (mid.length() > 0) frameOut += ",MID:" + mid;
+                  broadcast(frameOut);
+                } else {
+                  Serial.println("[MTALK] Duplicate retry mid=" + mid + ", suppressing re-broadcast");
+                }
                 // Send targeted delivery receipt back to the original sender.
                 if (mid.length() > 0) {
                   std::array<uint8_t, 8> senderDuid;
@@ -1984,22 +2018,23 @@ void handleFrame(const String& line) {
       // from the very first packet, with no separate GPS-request chain.
       // Legacy ducks that don't understand topic 27 still respond to the CDP
       // PING emitted by their own scan, so backward compatibility is preserved.
-      char gpsPayload[80] = {};
+      char gpsPayload[96] = {};
+      bool linked = isPhoneConnected();
 #ifdef ARDUINO_heltec_wifi_lora_32_V4
       if (tinyGps.location.isValid() && tinyGps.location.age() < 30000) {
-        snprintf(gpsPayload, sizeof(gpsPayload), "GPS,LAT:%.6f,LNG:%.6f",
-                 tinyGps.location.lat(), tinyGps.location.lng());
+        snprintf(gpsPayload, sizeof(gpsPayload), "GPS,LAT:%.6f,LNG:%.6f,PHONE:%d",
+                 tinyGps.location.lat(), tinyGps.location.lng(), linked ? 1 : 0);
       } else
 #endif
       if (phoneGpsLatBuf[0] != '\0') {
-        snprintf(gpsPayload, sizeof(gpsPayload), "GPS,LAT:%s,LNG:%s",
-                 phoneGpsLatBuf, phoneGpsLngBuf);
+        snprintf(gpsPayload, sizeof(gpsPayload), "GPS,LAT:%s,LNG:%s,PHONE:%d",
+                 phoneGpsLatBuf, phoneGpsLngBuf, linked ? 1 : 0);
       } else {
         // No GPS yet — send FIX:0 so the receiver still sees us in CDK:SEEN
         // and knows we exist even without coordinates this cycle.
-        strncpy(gpsPayload, "GPS,FIX:0", sizeof(gpsPayload) - 1);
+        snprintf(gpsPayload, sizeof(gpsPayload), "GPS,FIX:0,PHONE:%d", linked ? 1 : 0);
         // Request GPS from phone so next beacon or ACK carries real coordinates.
-        if (isPhoneConnected() && gpsReqDeferredSendMs == 0 && gpsReqSentMs == 0) {
+        if (linked && gpsReqDeferredSendMs == 0 && gpsReqSentMs == 0) {
           gpsReqDeferredSendMs = millis() + 300;
           Serial.println("[SCAN] Phone GPS cache empty — deferring CDK:GPSREQ");
         }

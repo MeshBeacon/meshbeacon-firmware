@@ -40,7 +40,6 @@
 #include "../../common/PhoneGpsHandler.h"
 #include "../../common/DeferredGpsTx.h"
 #include "../../common/SignalQuality.h"
-#include "security/SecurityEventCounters.h"
 
 // ADC_RESOLUTION is not defined in this board's variant.h; 14-bit gives
 // full-scale 16383 and must match the analogReadResolution(14) call in setup().
@@ -256,7 +255,13 @@ static void dspStatus(const char* line1, const char* line2 = nullptr) {
 // setup(), after all other hardware, mirroring MeshCore's setup() ordering.
 static BLEUart  bleuart;
 static bool     blePhoneSeen          = false;
-static String   bleInBuf              = "";
+// Fixed-size accumulator (NOT Arduino String) -- avoids per-byte heap
+// malloc/realloc/free churn across a long-running or many-cycles BLE
+// session, which was fragmenting the heap badly enough to eventually hard-
+// fault (landing in HardFault_Handler's infinite SOS-blink loop below,
+// which looks like the device "hangs" and goes permanently undiscoverable).
+static char     bleInBuf[512]         = {};
+static size_t   bleInLen              = 0;
 static volatile bool bleRxPending     = false;
 static char     bleRxLine[512]        = {};
 static bool     bleAdvertisingStarted = false;
@@ -333,7 +338,10 @@ static struct { int times; int onMs; int offMs; } gBeepReq = {};
 static unsigned long lastBattMs  = 0;
 
 // ── Per-duck GPS cache ────────────────────────────────────────────────────────
-struct DuckGps { float lat; float lng; unsigned long tsMs; };
+// hasFix/lat/lng and phoneConnected are refreshed independently of each other
+// (a packet may carry one, both, or neither) so each keeps the other's last
+// known value until this entry's own tsMs ages out past DUCK_GPS_TTL_MS.
+struct DuckGps { float lat; float lng; bool hasFix; bool phoneConnected; unsigned long tsMs; };
 static std::map<String, DuckGps> duckGpsCache;
 constexpr unsigned long DUCK_GPS_TTL_MS = 300000UL;   // 5 minutes
 
@@ -341,7 +349,7 @@ constexpr unsigned long DUCK_GPS_TTL_MS = 300000UL;   // 5 minutes
 static const uint8_t  TOPIC_BEACON      = 0x20;  // 32 -- was 27 (collided with topics::encrypted_cmd=0x1B)
 static const uint8_t  TOPIC_BEACON_ACK  = 0x21;  // 33 -- was 28 (collided with topics::sealed_uplink=0x1C)
 static volatile bool  beaconAckPending  = false;
-static char           beaconAckPayload[80] = {};
+static char           beaconAckPayload[96] = {};
 static unsigned long  beaconAckDeferMs  = 0;
 
 // ── Duck instance ─────────────────────────────────────────────────────────────
@@ -419,9 +427,35 @@ extern "C" __attribute__((naked, used)) void SVC_Handler(void) {
     );
 }
 
+// Persistent fault diagnostics -- survives a CPU reset (NOT a full power
+// loss) because it lives in a .noinit RAM section the startup code's
+// zero-fill loop never touches. HardFault_Handler() stashes the Cortex-M4
+// fault status registers here right before it enters the infinite SOS-blink
+// loop below (confirmed: the 3-fast/3-slow/3-fast LED pattern users report
+// IS this handler). setup() checks the magic value on the next boot (after
+// a manual reset/power-cycle) and prints a decoded report over Serial, then
+// clears it so it isn't re-reported on a later, unrelated boot.
+struct FaultRecord {
+    uint32_t magic;
+    uint32_t cfsr;
+    uint32_t hfsr;
+    uint32_t mmfar;
+    uint32_t bfar;
+    uint32_t lr;
+};
+#define FAULT_RECORD_MAGIC 0xFA17FA17UL
+__attribute__((section(".noinit"))) static FaultRecord gFaultRecord;
+
 // Override BSP's HardFault_Handler (NVIC_SystemReset) with SOS LED blinks
 // so a fault is visible without a serial monitor.  debug.cpp patched weak.
 extern "C" void HardFault_Handler(void) {
+    gFaultRecord.magic = FAULT_RECORD_MAGIC;
+    gFaultRecord.cfsr  = SCB->CFSR;
+    gFaultRecord.hfsr  = SCB->HFSR;
+    gFaultRecord.mmfar = SCB->MMFAR;
+    gFaultRecord.bfar  = SCB->BFAR;
+    gFaultRecord.lr    = (uint32_t)(uintptr_t)__builtin_return_address(0);
+
     NRF_P1->DIRSET = (1u << 1);
     while (true) {
         for (int i=0;i<3;i++){NRF_P1->OUTSET=(1u<<1);for(volatile uint32_t d=0;d<1920000u;d++){}NRF_P1->OUTCLR=(1u<<1);for(volatile uint32_t d=0;d<1920000u;d++){}}
@@ -444,7 +478,7 @@ static void ble_on_connect(uint16_t /*conn_handle*/) {
 static void ble_on_disconnect(uint16_t /*conn_handle*/, uint8_t reason) {
     blePhoneSeen = false;
     usbDisconnectDisplayPending = true;
-    bleInBuf = "";
+    bleInLen = 0;
     Serial.printf("[BLE] disconnected reason=0x%02X\n", reason); Serial.flush();
 }
 
@@ -453,14 +487,15 @@ static void ble_uart_rx_cb(uint16_t /*conn_handle*/) {
     while (bleuart.available()) {
         char c = (char)bleuart.read();
         if (c == '\n') {
-            if (bleInBuf.length() > 0) {
-                bleInBuf.toCharArray(bleRxLine, sizeof(bleRxLine));
+            if (bleInLen > 0) {
+                memcpy(bleRxLine, bleInBuf, bleInLen);
+                bleRxLine[bleInLen] = '\0';
                 bleRxPending = true;
             }
-            bleInBuf = "";
+            bleInLen = 0;
         } else if (c != '\r') {
-            if (bleInBuf.length() < (sizeof(bleRxLine) - 2))
-                bleInBuf += c;
+            if (bleInLen < sizeof(bleInBuf) - 1)
+                bleInBuf[bleInLen++] = c;
         }
     }
 }
@@ -690,6 +725,51 @@ void setup() {
 
     // USB serial (debug / phone comms)
     Serial.begin(115200);
+
+    // Always report the hardware reset-reason register (NRF_POWER->RESETREAS)
+    // -- unlike gFaultRecord below, this is set directly by the silicon's
+    // reset logic, so it's captured even if our own HardFault_Handler never
+    // got to run at all (e.g. a CPU LOCKUP -- a fault so severe the core
+    // can't even enter the handler -- triggers an automatic hardware reset
+    // on nRF52, bypassing any application code entirely). Bits cleared by
+    // writing them back so they don't accumulate across boots. Printed once
+    // (not retried) since this fires on EVERY boot, including routine
+    // dev-cycle resets -- unlike the rare fault-record case below, it's not
+    // worth adding boot delay here just to improve capture odds.
+    {
+        uint32_t resetreas = NRF_POWER->RESETREAS;
+        NRF_POWER->RESETREAS = resetreas;  // write-1-to-clear
+        Serial.printf("[RESET] RESETREAS=0x%08lX (RESETPIN=%d DOG=%d SREQ=%d LOCKUP=%d OFF=%d LPCOMP=%d DIF=%d NFC=%d VBUS=%d)\n",
+                      (unsigned long)resetreas,
+                      (int)(resetreas & 0x1), (int)((resetreas >> 1) & 0x1), (int)((resetreas >> 2) & 0x1),
+                      (int)((resetreas >> 3) & 0x1), (int)((resetreas >> 16) & 0x1), (int)((resetreas >> 17) & 0x1),
+                      (int)((resetreas >> 18) & 0x1), (int)((resetreas >> 19) & 0x1), (int)((resetreas >> 20) & 0x1));
+        Serial.flush();
+    }
+
+    // Report + clear any fault captured by HardFault_Handler() on a prior
+    // boot (see FaultRecord above) -- only happens when a crash actually
+    // happened, zero added delay on a normal boot.
+    //
+    // Repeated for a few seconds (not just once) because this board's USB
+    // CDC port needs the host OS to re-enumerate after a reset -- that can
+    // take 1-3s, long enough for a monitor that was already open to still
+    // miss a single print emitted right at Serial.begin(). Safe to keep
+    // retrying here since nothing else depends on Serial output this early.
+    if (gFaultRecord.magic == FAULT_RECORD_MAGIC) {
+        char faultMsg[160];
+        snprintf(faultMsg, sizeof(faultMsg),
+                 "[FAULT] Recovered from HardFault -- CFSR=0x%08lX HFSR=0x%08lX MMFAR=0x%08lX BFAR=0x%08lX LR=0x%08lX\n",
+                 (unsigned long)gFaultRecord.cfsr, (unsigned long)gFaultRecord.hfsr,
+                 (unsigned long)gFaultRecord.mmfar, (unsigned long)gFaultRecord.bfar,
+                 (unsigned long)gFaultRecord.lr);
+        for (int i = 0; i < 10; i++) {
+            Serial.print(faultMsg);
+            Serial.flush();
+            delay(300);
+        }
+        gFaultRecord.magic = 0;
+    }
 
     // Show display content immediately — before waiting for USB CDC so there
     // is always visual feedback even on fast crash/reset loops.
@@ -1126,28 +1206,18 @@ void loop() {
     if (bleAdvertisingStarted && !Bluefruit.connected() &&
         millis() - lastBleHealthMs >= BLE_HEALTH_INTERVAL_MS) {
         lastBleHealthMs = millis();
-        if (!bleIsAdvertising()) {
-            Serial.println("[BLE] watchdog: restarting advertising"); Serial.flush();
-            Bluefruit.Advertising.start(0);
-        }
-    }
-
-    // Periodic fail-closed rejection-count report, every 5 min, only when
-    // there's something to report (see SecurityEventCounters.h) -- lets an
-    // operator tell "keys are fine, we're blocking forged traffic" apart
-    // from "our own config/key is broken and legitimate traffic is being
-    // silently dropped", without ever trusting the rejected data itself.
-    // Uses the existing plaintext topics::status uplink (already relayed
-    // and stored as-is by MeshBeacon Ops), so no new wire format or
-    // server-side changes are needed.
-    {
-        static unsigned long lastSecEventsReportMs = 0;
-        if (millis() - lastSecEventsReportMs >= 300000UL) {
-            lastSecEventsReportMs = millis();
-            if (securityevents::hasEvents()) {
-                sendUplink(topics::status, securityevents::summary());
-                securityevents::reset();
-            }
+        bool advertising = bleIsAdvertising();
+        // Temporary diagnostic: log every tick (not just on restart) so a serial
+        // capture at the moment discoverability is lost shows whether the SoftDevice
+        // genuinely stopped advertising or whether something else (e.g. a stale
+        // "connected" state) is suppressing the watchdog/auto-restart entirely.
+        Serial.printf("[BLE] watchdog: connected=%d advertising=%d\n",
+                      Bluefruit.connected(), advertising);
+        if (!advertising) {
+            bool ok = Bluefruit.Advertising.start(0);
+            Serial.printf("[BLE] watchdog: restarting advertising -> %s\n",
+                          ok ? "OK" : "FAILED");
+            Serial.flush();
         }
     }
 
@@ -1173,7 +1243,7 @@ void loop() {
         if (displayEnabled) displayHome();
     }
 
-    // Periodic identity re-announce every 5 min (broadcast), so a peer that
+    // Periodic identity re-announce every 60 s (broadcast), so a peer that
     // missed the one-time announceIdentity() in setup() -- e.g. it booted
     // later, or was out of LoRa range at the time, or the broadcast packet
     // was simply lost (not uncommon over LoRa) -- eventually learns this
@@ -1183,7 +1253,11 @@ void loop() {
     // exchanged identities at least once. Runs unconditionally (harmless
     // when encryption is disabled -- sendMamaLink() falls back to plain
     // sendData() regardless of whether identities were exchanged).
-    if (millis() - lastIdentityAnnounceMs >= 300000UL) {
+    // Shortened from 5 min -> 60 s so a fresh pair of ducks finish the
+    // mutual TOFU handshake quickly instead of leaving MTALK failing with
+    // "no known public key for peer" for minutes after boot; the tradeoff
+    // is one extra small broadcast per duck per minute.
+    if (millis() - lastIdentityAnnounceMs >= 60000UL) {
         duck.announceIdentity();
         lastIdentityAnnounceMs = millis();
     }
@@ -1362,6 +1436,36 @@ void handleGpsRequestCommand() {
     }
 }
 
+// ── MTALK de-dup (avoid re-displaying resent retries) ─────────────────────
+// The mobile app's bounded auto-retry resends the same MTALK mid if it
+// hasn't seen our CDK:MACK receipt in time -- this usually means ITS COPY of
+// our ack was lost/delayed, not that the message itself failed to arrive.
+// Without this check, every such retry gets displayed again as a brand-new
+// incoming message (duplicate bubbles on the receiving device). Track the
+// last few (senderId, mid) pairs already delivered to the app and suppress
+// re-broadcasting duplicates seen within the window, while still re-sending
+// the ACK so the sender's retry loop can resolve.
+#define MTALK_DEDUP_SIZE 8
+#define MTALK_DEDUP_WINDOW_MS 60000UL
+static String mtalkSeenKeys[MTALK_DEDUP_SIZE];
+static unsigned long mtalkSeenTimes[MTALK_DEDUP_SIZE];
+static uint8_t mtalkSeenNext = 0;
+
+static bool isDuplicateMTalk(const String& senderId, const String& mid) {
+    if (mid.length() == 0) return false; // no mid, can't de-dup -- treat as new
+    String key = senderId + ":" + mid;
+    unsigned long now = millis();
+    for (uint8_t i = 0; i < MTALK_DEDUP_SIZE; i++) {
+        if (mtalkSeenKeys[i] == key && (now - mtalkSeenTimes[i]) < MTALK_DEDUP_WINDOW_MS) {
+            return true;
+        }
+    }
+    mtalkSeenKeys[mtalkSeenNext] = key;
+    mtalkSeenTimes[mtalkSeenNext] = now;
+    mtalkSeenNext = (mtalkSeenNext + 1) % MTALK_DEDUP_SIZE;
+    return false;
+}
+
 // ── handleDuckData ────────────────────────────────────────────────────────────
 void handleDuckData(CdpPacket packet) {
     bool isForMe    = (memcmp(packet.dduid.data(), duck.getDuckId().data(), 8) == 0);
@@ -1400,16 +1504,25 @@ void handleDuckData(CdpPacket packet) {
         }
         int latIdx = pdata.indexOf("LAT:");
         int lngIdx = pdata.indexOf("LNG:");
+        int phoneIdx = pdata.indexOf("PHONE:");
+        bool phoneKnown = phoneIdx >= 0;
+        bool phoneConnected = phoneKnown && pdata.charAt(phoneIdx + 6) == '1';
+        bool gotFix = false;
+        float lat = 0, lng = 0;
         if (latIdx >= 0 && lngIdx >= 0) {
             int latEnd = pdata.indexOf(',', latIdx + 4);
             int lngEnd = pdata.indexOf(',', lngIdx + 4);
-            float lat = pdata.substring(latIdx + 4, latEnd < 0 ? (int)pdata.length() : latEnd).toFloat();
-            float lng = pdata.substring(lngIdx + 4, lngEnd < 0 ? (int)pdata.length() : lngEnd).toFloat();
-            if (!(lat == 0.0f && lng == 0.0f)) {
-                char _buf9[9]; memcpy(_buf9, packet.sduid.data(), 8); _buf9[8] = 0;
-                String sid(_buf9);
-                duckGpsCache[sid] = { lat, lng, millis() };
-            }
+            lat = pdata.substring(latIdx + 4, latEnd < 0 ? (int)pdata.length() : latEnd).toFloat();
+            lng = pdata.substring(lngIdx + 4, lngEnd < 0 ? (int)pdata.length() : lngEnd).toFloat();
+            gotFix = !(lat == 0.0f && lng == 0.0f);
+        }
+        if (gotFix || phoneKnown) {
+            char _buf9[9]; memcpy(_buf9, packet.sduid.data(), 8); _buf9[8] = 0;
+            String sid(_buf9);
+            DuckGps& entry = duckGpsCache[sid];
+            if (gotFix) { entry.lat = lat; entry.lng = lng; entry.hasFix = true; }
+            if (phoneKnown) { entry.phoneConnected = phoneConnected; }
+            entry.tsMs = millis();
         }
     }
 
@@ -1428,20 +1541,23 @@ void handleDuckData(CdpPacket packet) {
         sid.trim();
         if (sid.length() > 0 && sid != String((const char*)duck.getDuckId().data())) {
             auto gpsIt = duckGpsCache.find(sid);
-            if (gpsIt != duckGpsCache.end() && millis() - gpsIt->second.tsMs < DUCK_GPS_TTL_MS) {
-                char seenBuf[80];
-                snprintf(seenBuf, sizeof(seenBuf), "CDK:SEEN,ID:%.8s,TYPE:%s,LAT:%.6f,LNG:%.6f",
+            bool fresh = gpsIt != duckGpsCache.end() && millis() - gpsIt->second.tsMs < DUCK_GPS_TTL_MS;
+            char seenBuf[96];
+            if (fresh && gpsIt->second.hasFix) {
+                snprintf(seenBuf, sizeof(seenBuf), "CDK:SEEN,ID:%.8s,TYPE:%s,LAT:%.6f,LNG:%.6f,PHONE:%d",
                          (char*)packet.sduid.data(), typeStr,
-                         gpsIt->second.lat, gpsIt->second.lng);
-                broadcast(seenBuf);
+                         gpsIt->second.lat, gpsIt->second.lng, gpsIt->second.phoneConnected ? 1 : 0);
+            } else if (fresh) {
+                snprintf(seenBuf, sizeof(seenBuf), "CDK:SEEN,ID:%.8s,TYPE:%s,PHONE:%d",
+                         (char*)packet.sduid.data(), typeStr, gpsIt->second.phoneConnected ? 1 : 0);
             } else {
-                char seenBuf[48];
                 snprintf(seenBuf, sizeof(seenBuf), "CDK:SEEN,ID:%.8s,TYPE:%s",
                          (char*)packet.sduid.data(), typeStr);
-                broadcast(seenBuf);
             }
+            broadcast(seenBuf);
         }
     }
+    Serial.println("[MTALK-DIAG] CDK:SEEN broadcast returned"); Serial.flush();
 
     if (!isForMe && !isBroadcast
         && packet.topic != TOPIC_BEACON && packet.topic != TOPIC_BEACON_ACK) return;
@@ -1452,6 +1568,7 @@ void handleDuckData(CdpPacket packet) {
         tmp.push_back(0);
         message = String((const char*)tmp.data());
     }
+    Serial.println("[MTALK-DIAG] message built, before switch(topic)"); Serial.flush();
 
     switch (packet.topic) {
         // encrypted_cmd (topic 8) is OpenDMS's decrypted, AUTHENTICATED
@@ -1600,7 +1717,6 @@ void handleDuckData(CdpPacket packet) {
             bool broadcastAuthenticated = verifyBroadcastMac(24, packet.data, verifiedBroadcast);
             if (meshgroupconfig::isConfigured() && !broadcastAuthenticated) {
                 logerr_ln("BROADCAST (topic 24) received but mesh group key is configured (authentication required) and MAC verification failed, dropping.");
-                securityevents::recordBroadcastRejected();
                 break;
             }
             String broadcastText;
@@ -1651,31 +1767,46 @@ void handleDuckData(CdpPacket packet) {
         // falls through to the default: case (ignored) below.
 
         case 26:  // MamaDuck-to-MamaDuck (MTALK)
-            if (duck.isMamaLinkEncryptionEnabled() && !packet.wasAuthenticated) {
-                logerr_ln("MTALK (topic 26) received but not authenticated (encrypted_data), dropping -- encryption is enabled for this build.");
-                break;
-            }
+            Serial.println("[MTALK-DIAG] case 26 entered"); Serial.flush();
+            // Fail-open (mirrors sendMamaLink()'s send-side cleartext
+            // fallback in UplinkRouter.h): MTALK prioritizes delivery over
+            // confidentiality, so an unauthenticated/plaintext MTALK is
+            // still accepted even when encryption is enabled for this
+            // build -- e.g. the very first message to/from a peer whose
+            // identity key hasn't been exchanged yet would otherwise be
+            // silently dropped.
             if (duckpayload::isProtobuf(packet.data.data(), packet.data.size())) {
               // ── Protobuf-encoded MTalk (see duck_payloads.proto) ─────────
               duckcdp_MTalk mtalk = duckcdp_MTalk_init_zero;
+              Serial.println("[MTALK-DIAG] before decodeMTalk"); Serial.flush();
               if (!duckpayload::decodeMTalk(packet.data.data(), packet.data.size(), mtalk)) {
                 break;
               }
+              Serial.println("[MTALK-DIAG] decodeMTalk OK"); Serial.flush();
               String senderId;
               {
                   char buf9[9]; memcpy(buf9, packet.sduid.data(), 8); buf9[8] = 0;
                   senderId = String(buf9);
               }
+              Serial.println("[MTALK-DIAG] senderId built"); Serial.flush();
               String mid = String(mtalk.mid);
+              Serial.println("[MTALK-DIAG] mid built"); Serial.flush();
               if (mtalk.kind == duckcdp_MTalkKind_MTALK_ACK) {
                 // Delivery receipt coming back to the original sender.
                 broadcast("CDK:MACK,ID:" + mid + ",FROM:" + senderId);
               } else {
                 // Incoming message.
                 String text = String(mtalk.text);
-                String frameOut = "CDK:MTALK,TEXT:" + text + ",FROM:" + senderId;
-                if (mid.length() > 0) frameOut += ",MID:" + mid;
-                broadcast(frameOut);
+                Serial.println("[MTALK-DIAG] text built"); Serial.flush();
+                if (!isDuplicateMTalk(senderId, mid)) {
+                  String frameOut = "CDK:MTALK,TEXT:" + text + ",FROM:" + senderId;
+                  if (mid.length() > 0) frameOut += ",MID:" + mid;
+                  Serial.println("[MTALK-DIAG] frameOut built, before broadcast"); Serial.flush();
+                  broadcast(frameOut);
+                  Serial.println("[MTALK-DIAG] broadcast(frameOut) returned"); Serial.flush();
+                } else {
+                  Serial.println("[MTALK-DIAG] duplicate retry, suppressing re-broadcast"); Serial.flush();
+                }
                 // Send targeted delivery receipt back to the original sender.
                 if (mid.length() > 0) {
                   std::array<uint8_t, 8> senderDuid;
@@ -1727,21 +1858,21 @@ void handleDuckData(CdpPacket packet) {
         case TOPIC_BEACON: {
             if (meshgroupconfig::isConfigured() && !beaconAuthenticated) {
                 logerr_ln("TOPIC_BEACON received but mesh group key is configured (encryption required), dropping.");
-                securityevents::recordBeaconRejected();
                 break;
             }
             if (memcmp(packet.sduid.data(), duck.getDuckId().data(), 8) == 0) break;
             if (!beaconAckPending && !gpsTxPending) {
-                char ownGps[80] = {};
+                char ownGps[96] = {};
+                bool linked = isPhoneConnected();
                 if (tinyGps.location.isValid() && tinyGps.location.age() < 30000) {
-                    snprintf(ownGps, sizeof(ownGps), "GPS,LAT:%.6f,LNG:%.6f",
-                             tinyGps.location.lat(), tinyGps.location.lng());
+                    snprintf(ownGps, sizeof(ownGps), "GPS,LAT:%.6f,LNG:%.6f,PHONE:%d",
+                             tinyGps.location.lat(), tinyGps.location.lng(), linked ? 1 : 0);
                 } else if (phoneGpsLatBuf[0] != '\0') {
-                    snprintf(ownGps, sizeof(ownGps), "GPS,LAT:%s,LNG:%s",
-                             phoneGpsLatBuf, phoneGpsLngBuf);
+                    snprintf(ownGps, sizeof(ownGps), "GPS,LAT:%s,LNG:%s,PHONE:%d",
+                             phoneGpsLatBuf, phoneGpsLngBuf, linked ? 1 : 0);
                 } else {
-                    strncpy(ownGps, "GPS,FIX:0", sizeof(ownGps) - 1);
-                    if (isPhoneConnected() && gpsReqDeferredSendMs == 0)
+                    snprintf(ownGps, sizeof(ownGps), "GPS,FIX:0,PHONE:%d", linked ? 1 : 0);
+                    if (linked && gpsReqDeferredSendMs == 0)
                         gpsReqDeferredSendMs = millis() + 300;
                 }
                 strncpy(beaconAckPayload, ownGps, sizeof(beaconAckPayload) - 1);
@@ -1753,7 +1884,6 @@ void handleDuckData(CdpPacket packet) {
         case TOPIC_BEACON_ACK:
             if (meshgroupconfig::isConfigured() && !beaconAuthenticated) {
                 logerr_ln("TOPIC_BEACON_ACK received but mesh group key is configured (encryption required), dropping.");
-                securityevents::recordBeaconRejected();
                 break;
             }
             if (memcmp(packet.sduid.data(), duck.getDuckId().data(), 8) == 0) break;
@@ -1973,16 +2103,17 @@ void handleFrame(const String& line) {
         case FT_GPS:   handleGps(body);   break;
         case FT_RADIOREGION: handleRadioRegion(body); break;
         case FT_SCAN: {
-            char gpsPayload[80] = {};
+            char gpsPayload[96] = {};
+            bool linked = isPhoneConnected();
             if (tinyGps.location.isValid() && tinyGps.location.age() < 30000) {
-                snprintf(gpsPayload, sizeof(gpsPayload), "GPS,LAT:%.6f,LNG:%.6f",
-                         tinyGps.location.lat(), tinyGps.location.lng());
+                snprintf(gpsPayload, sizeof(gpsPayload), "GPS,LAT:%.6f,LNG:%.6f,PHONE:%d",
+                         tinyGps.location.lat(), tinyGps.location.lng(), linked ? 1 : 0);
             } else if (phoneGpsLatBuf[0] != '\0') {
-                snprintf(gpsPayload, sizeof(gpsPayload), "GPS,LAT:%s,LNG:%s",
-                         phoneGpsLatBuf, phoneGpsLngBuf);
+                snprintf(gpsPayload, sizeof(gpsPayload), "GPS,LAT:%s,LNG:%s,PHONE:%d",
+                         phoneGpsLatBuf, phoneGpsLngBuf, linked ? 1 : 0);
             } else {
-                strncpy(gpsPayload, "GPS,FIX:0", sizeof(gpsPayload) - 1);
-                if (isPhoneConnected() && gpsReqDeferredSendMs == 0 && gpsReqSentMs == 0)
+                snprintf(gpsPayload, sizeof(gpsPayload), "GPS,FIX:0,PHONE:%d", linked ? 1 : 0);
+                if (linked && gpsReqDeferredSendMs == 0 && gpsReqSentMs == 0)
                     gpsReqDeferredSendMs = millis() + 300;
             }
             std::string beaconWire = meshgroupconfig::isConfigured()

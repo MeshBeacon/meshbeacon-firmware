@@ -60,7 +60,6 @@
 #include "../../common/PhoneGpsHandler.h"
 #include "../../common/DeferredGpsTx.h"
 #include "../../common/SignalQuality.h"
-#include "security/SecurityEventCounters.h"
 
 // ADC_RESOLUTION is not defined in this board's variant.h; 14-bit gives
 // full-scale 16383 and must match the analogReadResolution(14) call in setup().
@@ -251,7 +250,7 @@ static struct { int times; int onMs; int offMs; } gBeepReq = {};
 static unsigned long lastBattMs  = 0;
 
 // ── Per-duck GPS cache ────────────────────────────────────────────────────────
-struct DuckGps { float lat; float lng; unsigned long tsMs; };
+struct DuckGps { float lat; float lng; bool hasFix; bool phoneConnected; unsigned long tsMs; };
 static std::map<String, DuckGps> duckGpsCache;
 constexpr unsigned long DUCK_GPS_TTL_MS = 300000UL;   // 5 minutes
 
@@ -259,7 +258,7 @@ constexpr unsigned long DUCK_GPS_TTL_MS = 300000UL;   // 5 minutes
 static const uint8_t  TOPIC_BEACON      = 0x20;  // 32 -- was 27 (collided with topics::encrypted_cmd=0x1B)
 static const uint8_t  TOPIC_BEACON_ACK  = 0x21;  // 33 -- was 28 (collided with topics::sealed_uplink=0x1C)
 static volatile bool  beaconAckPending  = false;
-static char           beaconAckPayload[80] = {};
+static char           beaconAckPayload[96] = {};
 static unsigned long  beaconAckDeferMs  = 0;
 
 // ── Duck instance ─────────────────────────────────────────────────────────────
@@ -1034,24 +1033,7 @@ void loop() {
         }
     }
 
-    // Periodic fail-closed rejection-count report, every 5 min, only when
-    // there's something to report (see SecurityEventCounters.h) -- lets an
-    // operator tell "keys are fine, we're blocking forged traffic" apart
-    // from "our own config/key is broken and legitimate traffic is being
-    // silently dropped", without ever trusting the rejected data itself.
-    // Uses the existing plaintext topics::status uplink (already relayed
-    // and stored as-is by MeshBeacon Ops), so no new wire format or
-    // server-side changes are needed.
-    {
-        static unsigned long lastSecEventsReportMs = 0;
-        if (millis() - lastSecEventsReportMs >= 300000UL) {
-            lastSecEventsReportMs = millis();
-            if (securityevents::hasEvents()) {
-                sendUplink(topics::status, securityevents::summary());
-                securityevents::reset();
-            }
-        }
-    }
+
 
     while (Serial.available()) {
         lastUsbRxMs = millis();
@@ -1237,6 +1219,36 @@ void handleGpsRequestCommand() {
     }
 }
 
+// ── MTALK de-dup (avoid re-displaying resent retries) ─────────────────────
+// The mobile app's bounded auto-retry resends the same MTALK mid if it
+// hasn't seen our CDK:MACK receipt in time -- this usually means ITS COPY of
+// our ack was lost/delayed, not that the message itself failed to arrive.
+// Without this check, every such retry gets displayed again as a brand-new
+// incoming message (duplicate bubbles on the receiving device). Track the
+// last few (senderId, mid) pairs already delivered to the app and suppress
+// re-broadcasting duplicates seen within the window, while still re-sending
+// the ACK so the sender's retry loop can resolve.
+#define MTALK_DEDUP_SIZE 8
+#define MTALK_DEDUP_WINDOW_MS 60000UL
+static String mtalkSeenKeys[MTALK_DEDUP_SIZE];
+static unsigned long mtalkSeenTimes[MTALK_DEDUP_SIZE];
+static uint8_t mtalkSeenNext = 0;
+
+static bool isDuplicateMTalk(const String& senderId, const String& mid) {
+    if (mid.length() == 0) return false; // no mid, can't de-dup -- treat as new
+    String key = senderId + ":" + mid;
+    unsigned long now = millis();
+    for (uint8_t i = 0; i < MTALK_DEDUP_SIZE; i++) {
+        if (mtalkSeenKeys[i] == key && (now - mtalkSeenTimes[i]) < MTALK_DEDUP_WINDOW_MS) {
+            return true;
+        }
+    }
+    mtalkSeenKeys[mtalkSeenNext] = key;
+    mtalkSeenTimes[mtalkSeenNext] = now;
+    mtalkSeenNext = (mtalkSeenNext + 1) % MTALK_DEDUP_SIZE;
+    return false;
+}
+
 // ── handleDuckData ────────────────────────────────────────────────────────────
 void handleDuckData(CdpPacket packet) {
     bool isForMe    = (memcmp(packet.dduid.data(), duck.getDuckId().data(), 8) == 0);
@@ -1275,16 +1287,25 @@ void handleDuckData(CdpPacket packet) {
         }
         int latIdx = pdata.indexOf("LAT:");
         int lngIdx = pdata.indexOf("LNG:");
+        int phoneIdx = pdata.indexOf("PHONE:");
+        bool phoneKnown = phoneIdx >= 0;
+        bool phoneConnected = phoneKnown && pdata.charAt(phoneIdx + 6) == '1';
+        bool gotFix = false;
+        float lat = 0, lng = 0;
         if (latIdx >= 0 && lngIdx >= 0) {
             int latEnd = pdata.indexOf(',', latIdx + 4);
             int lngEnd = pdata.indexOf(',', lngIdx + 4);
-            float lat = pdata.substring(latIdx + 4, latEnd < 0 ? (int)pdata.length() : latEnd).toFloat();
-            float lng = pdata.substring(lngIdx + 4, lngEnd < 0 ? (int)pdata.length() : lngEnd).toFloat();
-            if (!(lat == 0.0f && lng == 0.0f)) {
-                char _buf9[9]; memcpy(_buf9, packet.sduid.data(), 8); _buf9[8] = 0;
-                String sid(_buf9);
-                duckGpsCache[sid] = { lat, lng, millis() };
-            }
+            lat = pdata.substring(latIdx + 4, latEnd < 0 ? (int)pdata.length() : latEnd).toFloat();
+            lng = pdata.substring(lngIdx + 4, lngEnd < 0 ? (int)pdata.length() : lngEnd).toFloat();
+            gotFix = !(lat == 0.0f && lng == 0.0f);
+        }
+        if (gotFix || phoneKnown) {
+            char _buf9[9]; memcpy(_buf9, packet.sduid.data(), 8); _buf9[8] = 0;
+            String sid(_buf9);
+            DuckGps& entry = duckGpsCache[sid];
+            if (gotFix) { entry.lat = lat; entry.lng = lng; entry.hasFix = true; }
+            if (phoneKnown) { entry.phoneConnected = phoneConnected; }
+            entry.tsMs = millis();
         }
     }
 
@@ -1303,18 +1324,20 @@ void handleDuckData(CdpPacket packet) {
         sid.trim();
         if (sid.length() > 0 && sid != String((const char*)duck.getDuckId().data())) {
             auto gpsIt = duckGpsCache.find(sid);
-            if (gpsIt != duckGpsCache.end() && millis() - gpsIt->second.tsMs < DUCK_GPS_TTL_MS) {
-                char seenBuf[80];
-                snprintf(seenBuf, sizeof(seenBuf), "CDK:SEEN,ID:%.8s,TYPE:%s,LAT:%.6f,LNG:%.6f",
+            bool fresh = gpsIt != duckGpsCache.end() && millis() - gpsIt->second.tsMs < DUCK_GPS_TTL_MS;
+            char seenBuf[96];
+            if (fresh && gpsIt->second.hasFix) {
+                snprintf(seenBuf, sizeof(seenBuf), "CDK:SEEN,ID:%.8s,TYPE:%s,LAT:%.6f,LNG:%.6f,PHONE:%d",
                          (char*)packet.sduid.data(), typeStr,
-                         gpsIt->second.lat, gpsIt->second.lng);
-                broadcast(seenBuf);
+                         gpsIt->second.lat, gpsIt->second.lng, gpsIt->second.phoneConnected ? 1 : 0);
+            } else if (fresh) {
+                snprintf(seenBuf, sizeof(seenBuf), "CDK:SEEN,ID:%.8s,TYPE:%s,PHONE:%d",
+                         (char*)packet.sduid.data(), typeStr, gpsIt->second.phoneConnected ? 1 : 0);
             } else {
-                char seenBuf[48];
                 snprintf(seenBuf, sizeof(seenBuf), "CDK:SEEN,ID:%.8s,TYPE:%s",
                          (char*)packet.sduid.data(), typeStr);
-                broadcast(seenBuf);
             }
+            broadcast(seenBuf);
         }
     }
 
@@ -1475,7 +1498,6 @@ void handleDuckData(CdpPacket packet) {
             bool broadcastAuthenticated = verifyBroadcastMac(24, packet.data, verifiedBroadcast);
             if (meshgroupconfig::isConfigured() && !broadcastAuthenticated) {
                 logerr_ln("BROADCAST (topic 24) received but mesh group key is configured (authentication required) and MAC verification failed, dropping.");
-                securityevents::recordBroadcastRejected();
                 break;
             }
             String broadcastText;
@@ -1526,10 +1548,13 @@ void handleDuckData(CdpPacket packet) {
         // falls through to the default: case (ignored) below.
 
         case 26:  // MamaDuck-to-MamaDuck (MTALK)
-            if (duck.isMamaLinkEncryptionEnabled() && !packet.wasAuthenticated) {
-                logerr_ln("MTALK (topic 26) received but not authenticated (encrypted_data), dropping -- encryption is enabled for this build.");
-                break;
-            }
+            // Fail-open (mirrors sendMamaLink()'s send-side cleartext
+            // fallback in UplinkRouter.h): MTALK prioritizes delivery over
+            // confidentiality, so an unauthenticated/plaintext MTALK is
+            // still accepted even when encryption is enabled for this
+            // build -- e.g. the very first message to/from a peer whose
+            // identity key hasn't been exchanged yet would otherwise be
+            // silently dropped.
             if (duckpayload::isProtobuf(packet.data.data(), packet.data.size())) {
               // ── Protobuf-encoded MTalk (see duck_payloads.proto) ─────────
               duckcdp_MTalk mtalk = duckcdp_MTalk_init_zero;
@@ -1548,9 +1573,11 @@ void handleDuckData(CdpPacket packet) {
               } else {
                 // Incoming message.
                 String text = String(mtalk.text);
-                String frameOut = "CDK:MTALK,TEXT:" + text + ",FROM:" + senderId;
-                if (mid.length() > 0) frameOut += ",MID:" + mid;
-                broadcast(frameOut);
+                if (!isDuplicateMTalk(senderId, mid)) {
+                  String frameOut = "CDK:MTALK,TEXT:" + text + ",FROM:" + senderId;
+                  if (mid.length() > 0) frameOut += ",MID:" + mid;
+                  broadcast(frameOut);
+                }
                 // Send targeted delivery receipt back to the original sender.
                 if (mid.length() > 0) {
                   std::array<uint8_t, 8> senderDuid;
@@ -1602,21 +1629,21 @@ void handleDuckData(CdpPacket packet) {
         case TOPIC_BEACON: {
             if (meshgroupconfig::isConfigured() && !beaconAuthenticated) {
                 logerr_ln("TOPIC_BEACON received but mesh group key is configured (encryption required), dropping.");
-                securityevents::recordBeaconRejected();
                 break;
             }
             if (memcmp(packet.sduid.data(), duck.getDuckId().data(), 8) == 0) break;
             if (!beaconAckPending && !gpsTxPending) {
-                char ownGps[80] = {};
+                char ownGps[96] = {};
+                bool linked = isPhoneConnected();
                 if (tinyGps.location.isValid() && tinyGps.location.age() < 30000) {
-                    snprintf(ownGps, sizeof(ownGps), "GPS,LAT:%.6f,LNG:%.6f",
-                             tinyGps.location.lat(), tinyGps.location.lng());
+                    snprintf(ownGps, sizeof(ownGps), "GPS,LAT:%.6f,LNG:%.6f,PHONE:%d",
+                             tinyGps.location.lat(), tinyGps.location.lng(), linked ? 1 : 0);
                 } else if (phoneGpsLatBuf[0] != '\0') {
-                    snprintf(ownGps, sizeof(ownGps), "GPS,LAT:%s,LNG:%s",
-                             phoneGpsLatBuf, phoneGpsLngBuf);
+                    snprintf(ownGps, sizeof(ownGps), "GPS,LAT:%s,LNG:%s,PHONE:%d",
+                             phoneGpsLatBuf, phoneGpsLngBuf, linked ? 1 : 0);
                 } else {
-                    strncpy(ownGps, "GPS,FIX:0", sizeof(ownGps) - 1);
-                    if (isPhoneConnected() && gpsReqDeferredSendMs == 0)
+                    snprintf(ownGps, sizeof(ownGps), "GPS,FIX:0,PHONE:%d", linked ? 1 : 0);
+                    if (linked && gpsReqDeferredSendMs == 0)
                         gpsReqDeferredSendMs = millis() + 300;
                 }
                 strncpy(beaconAckPayload, ownGps, sizeof(beaconAckPayload) - 1);
@@ -1628,7 +1655,6 @@ void handleDuckData(CdpPacket packet) {
         case TOPIC_BEACON_ACK:
             if (meshgroupconfig::isConfigured() && !beaconAuthenticated) {
                 logerr_ln("TOPIC_BEACON_ACK received but mesh group key is configured (encryption required), dropping.");
-                securityevents::recordBeaconRejected();
                 break;
             }
             if (memcmp(packet.sduid.data(), duck.getDuckId().data(), 8) == 0) break;
@@ -1835,16 +1861,17 @@ void handleFrame(const String& line) {
         case FT_GPS:   handleGps(body);   break;
         case FT_RADIOREGION: handleRadioRegion(body); break;
         case FT_SCAN: {
-            char gpsPayload[80] = {};
+            char gpsPayload[96] = {};
+            bool linked = isPhoneConnected();
             if (tinyGps.location.isValid() && tinyGps.location.age() < 30000) {
-                snprintf(gpsPayload, sizeof(gpsPayload), "GPS,LAT:%.6f,LNG:%.6f",
-                         tinyGps.location.lat(), tinyGps.location.lng());
+                snprintf(gpsPayload, sizeof(gpsPayload), "GPS,LAT:%.6f,LNG:%.6f,PHONE:%d",
+                         tinyGps.location.lat(), tinyGps.location.lng(), linked ? 1 : 0);
             } else if (phoneGpsLatBuf[0] != '\0') {
-                snprintf(gpsPayload, sizeof(gpsPayload), "GPS,LAT:%s,LNG:%s",
-                         phoneGpsLatBuf, phoneGpsLngBuf);
+                snprintf(gpsPayload, sizeof(gpsPayload), "GPS,LAT:%s,LNG:%s,PHONE:%d",
+                         phoneGpsLatBuf, phoneGpsLngBuf, linked ? 1 : 0);
             } else {
-                strncpy(gpsPayload, "GPS,FIX:0", sizeof(gpsPayload) - 1);
-                if (isPhoneConnected() && gpsReqDeferredSendMs == 0 && gpsReqSentMs == 0)
+                snprintf(gpsPayload, sizeof(gpsPayload), "GPS,FIX:0,PHONE:%d", linked ? 1 : 0);
+                if (linked && gpsReqDeferredSendMs == 0 && gpsReqSentMs == 0)
                     gpsReqDeferredSendMs = millis() + 300;
             }
             std::string beaconWire = meshgroupconfig::isConfigured()

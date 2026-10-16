@@ -29,6 +29,19 @@ CDPCFG_LORA_CLASS lora = new Module(CDPCFG_PIN_LORA_CS, CDPCFG_PIN_LORA_DIO0,
 
 volatile uint16_t DuckLoRa::interruptFlags = 0;
 volatile bool DuckLoRa::receivedFlag = false;
+volatile bool DuckLoRa::txBusy = false;
+
+// ---- TEMPORARY DIAGNOSTIC INSTRUMENTATION --------------------------------
+// Tracks what frequency we last *told* the radio to use, and how long gaps
+// between serviceInterruptFlags() calls (i.e. duck.run() calls) are, so we
+// can correlate MTALK reception failures with (a) the radio being parked
+// off the mesh frequency by the uplink-channel-spreading mechanism and/or
+// (b) loop() being blocked long enough to starve servicing. Safe to remove
+// once the root cause is confirmed.
+static float s_diagLastFreq = 0.0f;
+static unsigned long s_diagLastServiceMs = 0;
+static bool s_diagServiceMsInit = false;
+// ---------------------------------------------------------------------
 
 LoRaConfigParams DuckLoRa::defaultRadioParams = {
     /* band     = */ CDPCFG_RF_LORA_FREQ,
@@ -131,6 +144,24 @@ int DuckLoRa::setupRadio(const LoRaConfigParams &config) {
         logerr_ln("ERROR  output power is invalid");
         return DUCKLORA_ERR_SETUP;
     }
+#if defined(CDPCFG_RADIO_SX1262) || defined(CDPCFG_RADIO_LR1110)
+    // Use the DC-DC regulator (lower current draw than the LDO default) and
+    // enable RX boosted gain mode. Neither is applied automatically by
+    // begin() -- RadioLib only re-applies boosted gain in resetAGC() "if it
+    // was configured", confirming it defaults off (power-saving gain) on
+    // both SX126x and LR11x0 until explicitly enabled here. Boosted gain
+    // improves weak-signal/marginal-SNR sensitivity at the cost of a small
+    // increase in RX current draw -- matches meshtastic's LR11x0Interface
+    // and SX126xInterface setup for these radio families.
+    rc = lora.setRegulatorDCDC();
+    if (rc != RADIOLIB_ERR_NONE) {
+        logerr_ln("ERROR  failed to set DC-DC regulator mode: %d", rc);
+    }
+    rc = lora.setRxBoostedGainMode(true);
+    if (rc != RADIOLIB_ERR_NONE) {
+        logerr_ln("ERROR  failed to enable RX boosted gain mode: %d", rc);
+    }
+#endif
 #if defined(CDPCFG_RADIO_SX1262)
     // set the interrupt handler to execute when packet tx or rx is done.
     lora.setDio1Action(config.func);
@@ -165,6 +196,11 @@ int DuckLoRa::setupRadio(const LoRaConfigParams &config) {
         return DUCKLORA_ERR_RECEIVE;
     }
 
+    s_diagLastFreq = config.band;
+    s_diagLastServiceMs = millis();
+    s_diagServiceMsInit = true;
+    loginfo_ln("[DIAG] radio setup: mesh frequency %.3f MHz", config.band);
+
     loginfo_ln("LoRa radio setup complete");
     isSetup = true;
     return DUCK_ERR_NONE;
@@ -193,7 +229,18 @@ std::optional<std::vector<uint8_t>> DuckLoRa::readReceivedData() { //return a st
     if (packet_length < MIN_PACKET_LENGTH) {
         logerr_ln("ERROR  handlePacket rx data size invalid: %d", packet_length);
 
-        rxState = goToReceiveMode(true); // go back to receive mode and reset the receive flag
+        // Go back to receive mode and reset the receive flag, then bail out
+        // immediately. Falling through here used to proceed with a
+        // zero/undersized packet_length: packetBytes.resize(packet_length)
+        // produces an empty vector whose data() is not safely dereferenceable,
+        // and the later `&data[DATA_POS]` / `&data[packet_length]` pointer
+        // arithmetic forms a reversed (first > last) range that is undefined
+        // behavior when passed to std::vector::insert (it underflows to a
+        // huge size_t distance), causing a silent crash/heap corruption with
+        // no further log output. Always discard undersized/corrupt packets
+        // here instead of processing them.
+        goToReceiveMode(true);
+        return std::nullopt;
     }
 
     loginfo_ln("readReceivedData() - packet length returns: %d", packet_length);
@@ -293,6 +340,17 @@ int DuckLoRa::startReceive()
         logerr_ln("ERROR  LoRa radio not setup");
         return DUCKLORA_ERR_NOT_INITIALIZED;
     }
+#if defined(CDPCFG_RADIO_SX1262) || defined(CDPCFG_RADIO_LR1110)
+    // Re-apply preamble length before every RX re-arm. Meshtastic's RadioLib-based
+    // drivers for these same chip families (LR11x0/LR20x0/SX126x) independently carry
+    // this exact workaround with the comment "Solve RX ack fail after direct message
+    // sent. Not sure why this is needed." -- i.e. something about these chips'
+    // internal state after a TX can leave the RX preamble detector out of sync unless
+    // it's explicitly re-pushed on every startReceive(). Value matches the preamble
+    // length RadioLib's begin() already establishes by default (8 symbols), so this
+    // changes no behavior other than defending against that reset.
+    lora.setPreambleLength(8);
+#endif
     int state = lora.startReceive();
 
     if (state != RADIOLIB_ERR_NONE) {
@@ -336,6 +394,8 @@ int DuckLoRa::setUplinkFrequency(float freqMHz) {
         logerr_ln("ERROR  setUplinkFrequency failed, freq = %f, rc = %d", freqMHz, rc);
         return DUCKLORA_ERR_SETUP;
     }
+    s_diagLastFreq = freqMHz;
+    loginfo_ln("[DIAG] spread to uplink frequency %.3f MHz at t=%lu ms (mesh=%.3f)", freqMHz, millis(), defaultRadioParams.band);
     return DUCK_ERR_NONE;
 }
 
@@ -369,6 +429,14 @@ int DuckLoRa::sleep()
 }
 
 void DuckLoRa::serviceInterruptFlags() {
+    if (s_diagServiceMsInit) {
+        unsigned long nowMs = millis();
+        unsigned long gap = nowMs - s_diagLastServiceMs;
+        if (gap > 250) {
+            loginfo_ln("[DIAG] duck.run() gap was %lu ms (last freq told to radio: %.3f MHz)", gap, s_diagLastFreq);
+        }
+        s_diagLastServiceMs = nowMs;
+    }
     if (DuckLoRa::interruptFlags != 0) {
 
 #ifdef CDPCFG_RADIO_SX1262
@@ -397,7 +465,10 @@ void DuckLoRa::serviceInterruptFlags() {
         if (DuckLoRa::interruptFlags & RADIOLIB_SX126X_IRQ_TX_DONE ) {
             loginfo_ln("SX1262 Interrupt flag was set: payload transmission complete");
             lora.finishTransmit();
+            txBusy = false;
             lora.setFrequency(defaultRadioParams.band); // restore mesh channel
+            s_diagLastFreq = defaultRadioParams.band;
+            loginfo_ln("[DIAG] TX_DONE restored mesh frequency %.3f MHz at t=%lu ms", defaultRadioParams.band, millis());
             goToReceiveMode(false);
         }
         if (DuckLoRa::interruptFlags & RADIOLIB_SX126X_IRQ_TIMEOUT ) {
@@ -424,7 +495,10 @@ void DuckLoRa::serviceInterruptFlags() {
         if (DuckLoRa::interruptFlags & RADIOLIB_LR11X0_IRQ_TX_DONE ) {
             loginfo_ln("LR1110 Interrupt flag was set: payload transmission complete");
             lora.finishTransmit();
+            txBusy = false;
             lora.setFrequency(defaultRadioParams.band); // restore mesh channel
+            s_diagLastFreq = defaultRadioParams.band;
+            loginfo_ln("[DIAG] TX_DONE restored mesh frequency %.3f MHz at t=%lu ms", defaultRadioParams.band, millis());
             goToReceiveMode(false);
         }
         if (DuckLoRa::interruptFlags & RADIOLIB_LR11X0_IRQ_TIMEOUT ) {
@@ -451,6 +525,7 @@ void DuckLoRa::serviceInterruptFlags() {
         }
         if (DuckLoRa::interruptFlags & RADIOLIB_SX127X_CLEAR_IRQ_FLAG_TX_DONE) {
             loginfo_ln("SX127x Interrupt flag was set: payload transmission complete");
+            txBusy = false;
             lora.setFrequency(defaultRadioParams.band); // restore mesh channel
             goToReceiveMode(false); // go back to receive mode and reset the receive flag
         }
@@ -482,11 +557,34 @@ int DuckLoRa::startTransmitData(uint8_t* data, int length) {
         return DUCKLORA_ERR_NOT_INITIALIZED;
     }
 
+    // This is a single half-duplex radio -- only one physical transmission
+    // can be in flight at a time. Some call sites issue two sendData()
+    // calls back to back with no intervening wait (e.g. UplinkRouter.h's
+    // sendMamaLink(), which fires announceIdentity() immediately followed
+    // by sendEncryptedData() the first time it talks to a given peer each
+    // boot). Without waiting here, the second startTransmit() below would
+    // hit the radio while it's still actively driving the PA for the first
+    // packet -- corrupting both packets and yanking the PA into an
+    // undefined state mid-transmit, a much bigger instantaneous current
+    // transient than two cleanly sequential transmissions, and a plausible
+    // brownout trigger. Bounded wait so a stuck txBusy (e.g. a missed
+    // TX_DONE IRQ) can't hang the caller forever.
+    unsigned long waitStart = millis();
+    while (txBusy && (millis() - waitStart) < 2000) {
+        vTaskDelay(1);
+    }
+    if (txBusy) {
+        logerr_ln("ERROR startTransmitData: radio still busy after 2s wait, proceeding anyway");
+    }
+
     loginfo_ln("TX data");
     logdbg_ln(" -> len: %d, %s", length, duckutils::toString(data, length).c_str());
 
     long t1 = millis();
-    // non blocking transmit
+    // non blocking transmit -- mark the radio busy BEFORE issuing it so
+    // nothing else can start a second transmit while this one is still
+    // physically going out over the air (see isTransmitting()'s doc comment).
+    txBusy = true;
     tx_err = lora.startTransmit(data, length);
     switch (tx_err) {
         case RADIOLIB_ERR_NONE:
