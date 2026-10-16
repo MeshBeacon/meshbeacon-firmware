@@ -1700,10 +1700,13 @@ void handleDuckData(CdpPacket packet) {
         // falls through to the default: case (ignored) below.
 
         case 26:  // MamaDuck-to-MamaDuck (MTALK)
-            if (duck.isMamaLinkEncryptionEnabled() && !packet.wasAuthenticated) {
-                logerr_ln("MTALK (topic 26) received but not authenticated (encrypted_data), dropping -- encryption is enabled for this build.");
-                break;
-            }
+            // Fail-open (mirrors sendMamaLink()'s send-side cleartext
+            // fallback in UplinkRouter.h): MTALK prioritizes delivery over
+            // confidentiality, so an unauthenticated/plaintext MTALK is
+            // still accepted even when encryption is enabled for this
+            // build -- e.g. the very first message to/from a peer whose
+            // identity key hasn't been exchanged yet would otherwise be
+            // silently dropped.
             if (duckpayload::isProtobuf(packet.data.data(), packet.data.size())) {
               // ── Protobuf-encoded MTalk (see duck_payloads.proto) ─────────
               duckcdp_MTalk mtalk = duckcdp_MTalk_init_zero;

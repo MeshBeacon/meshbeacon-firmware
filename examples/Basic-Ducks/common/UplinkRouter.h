@@ -99,11 +99,22 @@ inline unsigned long lastIdentityAnnounceMs = 0;
 // peer's identity key, NOT OpenDMS's static uplink key.
 //
 // Gated by duck.isMamaLinkEncryptionEnabled() -- same "only encrypt if
-// enabled at build" policy as sendUplink(), no exception for MTALK: if
-// encryption isn't enabled (DUCK_CRYPTO_DEFAULT_ENABLED=0 at build and never
-// turned on at runtime -- see Duck.h's setUplinkEncryptionEnabled()), MTALK
-// is sent as plain duck.sendData() instead.
-
+// enabled at build" policy as sendUplink(): if encryption isn't enabled
+// (DUCK_CRYPTO_DEFAULT_ENABLED=0 at build and never turned on at runtime --
+// see Duck.h's setUplinkEncryptionEnabled()), MTALK is sent as plain
+// duck.sendData() instead.
+//
+// Fail-open when encryption IS enabled: sendEncryptedData() requires the
+// peer's identity key to already be known (learnPeerIdentity()), which is
+// never true for the very first message to a never-before-contacted peer --
+// the directed announceIdentity() just above can't complete its LoRa
+// round-trip before this same call tries to encrypt. Rather than silently
+// losing that first message (DUCK_ERR_CRYPTO_ECDH_FAILED with nothing sent),
+// fall back to plaintext duck.sendData(), same availability-over-
+// confidentiality choice already made for sendUplinkSos() above. This
+// reduces MTALK's confidentiality guarantee (a passive eavesdropper can read
+// any MTALK that goes out before identity exchange completes) in exchange
+// for message delivery reliability.
 inline int sendMamaLink(const std::string& data, const std::array<uint8_t, 8>& targetDuid) {
     if (!duck.isMamaLinkEncryptionEnabled()) {
         return duck.sendData(26, data, targetDuid);
@@ -111,7 +122,12 @@ inline int sendMamaLink(const std::string& data, const std::array<uint8_t, 8>& t
     if (announcedIdentityTo.insert(targetDuid).second) {
         duck.announceIdentity(targetDuid);
     }
-    return duck.sendEncryptedData(26, data, targetDuid);
+    int rc = duck.sendEncryptedData(26, data, targetDuid);
+    if (rc != DUCK_ERR_NONE) {
+        Serial.println("[MTALK] sendEncryptedData() failed -- falling back to cleartext (availability > confidentiality).");
+        return duck.sendData(26, data, targetDuid);
+    }
+    return rc;
 }
 
 #endif  // UPLINKROUTER_H_
