@@ -34,7 +34,20 @@ def _gen_factory_bin(source, target, env):
     app_offset = env.subst("$ESP32_APP_OFFSET")
     factory_bin = os.path.join(build_dir, "firmware.factory.bin")
 
-    esptool = os.path.join(env.PioPlatform().get_package_dir("tool-esptoolpy") or "", "esptool.py")
+    # "tool-esptoolpy" is the Python esptool.py package used by
+    # platform-espressif32 <8.0.0. Newer platform releases renamed/replaced
+    # it with a prebuilt "tool-esptool" binary (and merge_bin -> merge-bin),
+    # so get_package_dir() can raise KeyError there instead of returning None.
+    # Skip (rather than crash the whole build) if the package isn't available.
+    try:
+        esptoolpy_dir = env.PioPlatform().get_package_dir("tool-esptoolpy")
+    except KeyError:
+        esptoolpy_dir = None
+    if not esptoolpy_dir:
+        print("gen_esp32_factory_bin: 'tool-esptoolpy' package not found (platform-espressif32 "
+              "version mismatch?), skipping factory.bin generation")
+        return
+    esptool = os.path.join(esptoolpy_dir, "esptool.py")
     merge_args = [
         env.subst("$PYTHONEXE"),
         esptool,
