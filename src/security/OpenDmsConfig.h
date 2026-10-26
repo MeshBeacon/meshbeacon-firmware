@@ -19,7 +19,7 @@
  *    `duck_crypto.public_key` / DUCK_CRYPTO_PUBLIC_KEY.
  *  - field provisioning: begin() loads a previously field-provisioned key
  *    from flash if one was written via the serial provisioning command
- *    (see checkSerialProvisioning()), so a device does not need to be
+ *    (see tryHandleSerialLine()), so a device does not need to be
  *    reflashed just to join a particular OpenDMS instance's mesh.
  *    Overrides the build-flag/compile-time value if present.
  * This key is not secret (only the matching private key, held by OpenDMS,
@@ -37,6 +37,7 @@
 #define OPENDMSCONFIG_H_
 
 #include <stdint.h>
+#include <string>
 #include "DuckCrypto.h"
 
 namespace opendmsconfig {
@@ -83,10 +84,18 @@ bool isConfigured();
  * only provisioning convenience (see docs/crypto-design.tex, "Field
  * Operator Onboarding").
  *
- * Non-blocking: returns immediately if no complete line is available
- * yet. Intended to be called once per main loop iteration.
+ * Does NOT read Serial itself -- callers (Duck::run()'s centralized serial
+ * line reader) own reading/buffering Serial and pass each completed line
+ * here. This keeps there from being multiple independent competing
+ * Serial.read() consumers, which previously raced with each other (and
+ * with application code) and silently dropped host->device bytes.
+ *
+ * @param line a complete line read from Serial (no trailing \\n/\\r).
+ * @return true if this line matched one of this module's commands and was
+ *         handled, false if it was not recognized (caller should try
+ *         another handler, or treat it as application data).
  */
-void checkSerialProvisioning();
+bool tryHandleSerialLine(const std::string& line);
 
 } // namespace opendmsconfig
 

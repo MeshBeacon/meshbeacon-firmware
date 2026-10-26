@@ -185,6 +185,12 @@ class DuckLoRa {
 
     private:
         static volatile uint16_t interruptFlags;
+        // Set directly from hardware interrupt context (see onInterrupt()'s
+        // doc comment below for why it must stay a simple flag write).
+        // Serviced (and cleared) by serviceInterruptFlags() on the main
+        // loop task, which is where the actual lora.getIrqFlags() SPI
+        // transaction now happens.
+        static volatile bool interruptTriggered;
         static volatile bool receivedFlag;
         static volatile bool txBusy;
         volatile bool isSetup = false;
@@ -238,6 +244,16 @@ class DuckLoRa {
         /*
         * @brief Interrupt service routine for the LoRa module.
         *
+        * IMPORTANT: this runs in true hardware interrupt context (attached
+        * via lora.setDio1Action()/setIrqAction()/setDio0Action()). It must
+        * do nothing more than set a volatile flag -- in particular it must
+        * NOT call lora.getIrqFlags() or any other RadioLib method that
+        * issues an SPI transaction. On ESP32, the Arduino SPI driver takes
+        * a FreeRTOS mutex/semaphore for each transaction; doing that from
+        * ISR context (while the main loop task may already hold the same
+        * SPI bus lock, e.g. mid-transmit) is unsafe and can hang or panic
+        * the task watchdog. The actual flag read is deferred to
+        * serviceInterruptFlags(), which runs on the main loop task.
         */
         static void onInterrupt();
 

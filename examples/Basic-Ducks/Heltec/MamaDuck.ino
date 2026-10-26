@@ -152,6 +152,7 @@ static int32_t currentRssiDbm() {
  void displayBatt();
  void displayHome();
  void handleFrame(const String& line);
+ void onUsbSerialLine(const String& line);
  void broadcast(const String& frame);
  void sendBattery();
  void handleSOS(const String& body);
@@ -160,6 +161,7 @@ static int32_t currentRssiDbm() {
  bool sendMamaTalk(const String& targetId, const String& msg, const String& mid = "");
  void sendFrame(const String& frame);
  void handleGps(const String& body);
+ void handleGpsRequestCommand();
  static float readVbat();
  void blinkLed(int frequency);
  static void quickBlink();
@@ -182,7 +184,18 @@ static NimBLECharacteristic* pTxChar    = nullptr;
 static NimBLEServer*          pBleServer = nullptr;  // stored for updateConnParams
 static bool bleConnected = false;
 static String bleInBuf = "";
-static String usbInBuf = "";
+// onWrite() (RxCallbacks below) runs on the NimBLE host task, which has a
+// small stack. handleFrame()'s call chain (handleSOS/handleMsg -> protobuf
+// encode -> OpenDMS crypto sealing -> duck.sendData() -> RadioLib SX1262 TX
+// -> display I2C) is deep enough to overflow it, observed as a real
+// "Stack canary watchpoint triggered (nimble_host)" panic. So onWrite()
+// only queues completed frames here; loop() drains the queue and calls
+// handleFrame() with the main Arduino task's much larger stack, mirroring
+// how the USB path below already processes synchronously from loop().
+static portMUX_TYPE bleFrameQueueMux = portMUX_INITIALIZER_UNLOCKED;
+static String  blePendingFrames[4];
+static uint8_t blePendingHead  = 0;
+static uint8_t blePendingCount = 0;
 static unsigned long lastUsbRxMs = 0;   // last time a byte arrived over USB
 static bool usbPhoneSeen = false;        // true once phone sends any CDK frame via USB
 static bool          bleAdvertising    = true;   // track advertising state
@@ -238,6 +251,17 @@ static unsigned long  sosWaitStartMs    = 0;
 const  unsigned long  SOS_GPS_WAIT_MS   = 2500UL;
 const  uint32_t       SOS_HOLD_MS       = 2000UL;   // matches button.pressedFor(2000) below
 
+// ── Power-off (deep sleep) state (non-blocking) ──────────────────────────────
+// Quadruple-click arms a confirmation window; a FOLLOW-UP single click within
+// POWER_OFF_CONFIRM_MS commits to heltec_deep_sleep() (true power off --
+// wakes via a fresh press of the same PRG button; see HELTEC_POWER_BUTTON in
+// platformio.ini). Two distinct, deliberate gestures (4 clicks then 1 click)
+// are required so this can never collide with the existing 2s-hold SOS
+// gesture or the plain single-click display-toggle/dismiss gesture.
+static bool           powerOffConfirmPending = false;
+static unsigned long  powerOffConfirmArmedMs = 0;
+const  unsigned long  POWER_OFF_CONFIRM_MS   = 5000UL;
+
 // ── Per-duck GPS cache ────────────────────────────────────────────────────────
 // Populated whenever a packet containing LAT:/LNG: fields arrives from any duck.
 // Entries are valid for 5 minutes (same TTL as the app's Nearby Ducks list).
@@ -271,6 +295,10 @@ class ServerCallbacks : public NimBLEServerCallbacks {
   void onDisconnect(NimBLEServer*, NimBLEConnInfo& connInfo, int reason) override {
     bleConnected = false;
     bleInBuf = "";
+    portENTER_CRITICAL(&bleFrameQueueMux);
+    blePendingHead = 0;
+    blePendingCount = 0;  // drop any frames queued but not yet drained by loop()
+    portEXIT_CRITICAL(&bleFrameQueueMux);
     bleDisconnectDisplayPending = true;  // notify main loop to render splash
     // Only restart advertising if USB is not currently active
     bool usbActive = (lastUsbRxMs > 0 && millis() - lastUsbRxMs < USB_IDLE_TIMEOUT_MS);
@@ -291,7 +319,18 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* pChar, NimBLEConnInfo& connInfo) override {
     std::string val = pChar->getValue();
     for (char c : val) {
-      if (c == '\n') { handleFrame(bleInBuf); bleInBuf = ""; }
+      if (c == '\n') {
+        // Queue only -- do NOT call handleFrame() here. See the
+        // blePendingFrames comment near bleInBuf's declaration.
+        portENTER_CRITICAL(&bleFrameQueueMux);
+        if (blePendingCount < 4) {
+          uint8_t tail = (blePendingHead + blePendingCount) % 4;
+          blePendingFrames[tail] = bleInBuf;
+          blePendingCount++;
+        }  // else: queue full (4 unconsumed frames) -- drop, back-pressure
+        portEXIT_CRITICAL(&bleFrameQueueMux);
+        bleInBuf = "";
+      }
       else if (c != '\r') bleInBuf += c;
     }
   }
@@ -379,10 +418,16 @@ class TxCallbacks : public NimBLECharacteristicCallbacks {
      }
    }
 
-   if (duck.setupWithDefaults() != DUCK_ERR_NONE) {
+   // heltec_setup() (above) already called Serial.begin() -- skip the
+   // library's own Serial.begin() to avoid a redundant re-init that
+   // silently breaks USB host->device RX (TX is unaffected, which made
+   // this very hard to diagnose). See Duck::setupWithDefaults().
+   if (duck.setupWithDefaults(/*skipSerialInit=*/true) != DUCK_ERR_NONE) {
      Serial.println("[MAMA] Failed to setup MamaDuck");
      return;
    }
+   Serial.printf("[HEAP-DIAG] after setupWithDefaults: freeHeap=%u minFreeHeap=%u largestFreeBlock=%u\n",
+                 ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getMaxAllocHeap());
    // Without this the duck spends up to 80 s in SEARCHING state where
    // duck.run() silently discards every received packet and sendData()
    // transmits nothing. Both ducks are standalone peers — no join needed.
@@ -422,11 +467,19 @@ class TxCallbacks : public NimBLECharacteristicCallbacks {
   displayHome();
 
   duck.onReceiveDuckData(handleDuckData);
+  // Route USB serial lines that aren't a built-in AT+ provisioning command
+  // (e.g. "CDK:..." app frames) here. duck.run() is the only code that
+  // reads Serial directly -- see onUsbSerialLine()'s comment.
+  duck.setOnUnhandledSerialLine(onUsbSerialLine);
   heltec_delay(5000);
   displayHome();
 
- Serial.begin(115200);
-  delay(200);
+  // NOTE: do NOT call Serial.begin() again here — heltec_setup() already
+  // initialized Serial once. A redundant second Serial.begin() at this point
+  // was found to break USB RX entirely (Serial.available() always returned 0
+  // for host->device bytes, even though TX kept working) while leaving TX
+  // unaffected, making the bug very hard to spot. See repo memory for the
+  // full investigation.
 #ifdef SERIAL_PORT_USBVIRTUAL
   Serial.setTxTimeoutMs(0);  // never block on TX when host hasn't opened the port yet
 #endif
@@ -488,7 +541,7 @@ class TxCallbacks : public NimBLECharacteristicCallbacks {
     display.setTextAlignment(TEXT_ALIGN_CENTER);
     display.drawString(64, 28, TXT_BT_CONNECTED);
     display.display();
-    bleSplashClearMs = millis() + 2000;
+    bleSplashClearMs = millis() + 3000;
   }
 
   if (bleSplashClearMs > 0 && millis() >= bleSplashClearMs) {
@@ -518,7 +571,7 @@ class TxCallbacks : public NimBLECharacteristicCallbacks {
     display.setTextAlignment(TEXT_ALIGN_CENTER);
     display.drawString(64, 28, TXT_BT_DISCONNECTED);
     display.display();
-    delay(2000);
+    delay(3000);
     displayHome();
   }
 
@@ -531,7 +584,7 @@ class TxCallbacks : public NimBLECharacteristicCallbacks {
     display.setTextAlignment(TEXT_ALIGN_CENTER);
     display.drawString(64, 28, TXT_USB_CONNECTED);
     display.display();
-    delay(2000);
+    delay(3000);
     displayHome();
   }
 
@@ -545,7 +598,7 @@ class TxCallbacks : public NimBLECharacteristicCallbacks {
     display.setTextAlignment(TEXT_ALIGN_CENTER);
     display.drawString(64, 28, TXT_USB_DISCONNECTED);
     display.display();
-    delay(2000);
+    delay(3000);
     displayHome();
   }
 
@@ -602,6 +655,14 @@ class TxCallbacks : public NimBLECharacteristicCallbacks {
     messagePending = false;
     displayEnabled = true;
     display.displayOn();
+    displayHome();
+  }
+
+  // Auto-cancel the power-off confirmation if the user doesn't follow up
+  // with a single click in time, so the device never gets stuck showing a
+  // stale "click again to power off" screen.
+  if (powerOffConfirmPending && (millis() - powerOffConfirmArmedMs >= POWER_OFF_CONFIRM_MS)) {
+    powerOffConfirmPending = false;
     displayHome();
   }
 
@@ -730,7 +791,34 @@ class TxCallbacks : public NimBLECharacteristicCallbacks {
   }
 
   if (button.isSingleClick()) {
-    if (sosPending) {
+    if (powerOffConfirmPending) {
+      // Confirmed — actually power off. heltec_deep_sleep() itself turns off
+      // the display/radio/LED. We intentionally do NOT build with
+      // -DHELTEC_POWER_BUTTON (see platformio.ini): that flag makes the
+      // vendor library's heltec_loop() call heltec_deep_sleep() on its own
+      // whenever the button is held >= 1 s, which fired before our 2 s SOS
+      // hold-to-send threshold could ever complete (same shared `button`
+      // object) -- it looked like the device randomly powering off/"crashing"
+      // whenever someone tried a hardware-button SOS. So instead we arm the
+      // wake source ourselves, right here, only for OUR OWN confirmed
+      // power-off flow: GPIO0 as ext0 wake source, then wait for physical
+      // button release before sleeping so a later fresh press reliably
+      // wakes the device (same precaution needed on the nRF52 boards'
+      // systemOff()).
+      powerOffConfirmPending = false;
+      display.displayOn();
+      displayEnabled = true;
+      display.clear();
+      display.setFont(ArialMT_Plain_10);
+      display.setTextAlignment(TEXT_ALIGN_CENTER);
+      display.drawString(64, 28, TXT_POWERING_OFF);
+      display.display();
+      Serial.println("[MAMA] Power-off confirmed — entering deep sleep");
+      heltec_delay(600);
+      esp_sleep_enable_ext0_wakeup(BUTTON, LOW);
+      button.waitForRelease();
+      heltec_deep_sleep();
+    } else if (sosPending) {
       // Cancel the deferred SOS wait — user tapped instead of waiting it out.
       sosPending = false;
       displayID();
@@ -867,6 +955,25 @@ class TxCallbacks : public NimBLECharacteristicCallbacks {
   }
 #endif
 
+  // Quadruple-click: arm power-off confirmation (all Heltec variants). This
+  // only ARMS a confirmation window — nothing happens to the radio/device
+  // until a follow-up single click confirms it (see isSingleClick() above)
+  // or the window times out (see the loop()-top auto-cancel check above).
+  if (button.isQuadrupleClick()) {
+    powerOffConfirmPending = true;
+    powerOffConfirmArmedMs = millis();
+    display.displayOn();
+    displayEnabled = true;
+    display.clear();
+    displayID();
+    displayBatt();
+    display.setFont(ArialMT_Plain_10);
+    display.setTextAlignment(TEXT_ALIGN_CENTER);
+    display.drawString(64, 28, TXT_POWER_OFF_CONFIRM_2L);
+    display.display();
+    Serial.println("[MAMA] Quadruple-click: power-off confirmation armed");
+  }
+
   // Periodically announce identity over USB until the phone replies with any CDK frame.
   // NOT gated on (bool)Serial — Android apps typically don't assert DTR, so (bool)Serial
   // stays false even when the port is open. setTxTimeoutMs(0) in setup() ensures writes
@@ -901,18 +1008,48 @@ class TxCallbacks : public NimBLECharacteristicCallbacks {
   }
 
   // USB incoming
-  while (Serial.available()) {
-    lastUsbRxMs = millis();  // mark USB as active
-    char c = Serial.read();
-    if (c == '\n') {
-      if (usbInBuf.startsWith("CDK:")) {
-        if (!usbPhoneSeen) usbConnectDisplayPending = true;  // first CDK frame → show splash
-        usbPhoneSeen = true;  // phone sent a valid frame
-      }
-      handleFrame(usbInBuf);
-      usbInBuf = "";
+  //
+  // NOTE: duck.run() (called later in this loop()) is now the ONLY code
+  // that reads Serial.available()/Serial.read() -- it centrally buffers
+  // one line at a time, tries each built-in AT+ provisioning command
+  // (OpenDmsConfig/MeshGroupConfig/RadioRegionConfig), and for any line
+  // none of those recognize, invokes onUsbSerialLine() (registered below
+  // in setup() via duck.setOnUnhandledSerialLine()). Previously this block
+  // ran its own independent `while (Serial.available())` drain loop here,
+  // which raced with the three AT+ provisioning modules' own independent
+  // drain loops (run inside duck.run()) for the same incoming bytes --
+  // whichever one happened to run in the loop() iteration where bytes
+  // arrived would silently consume (and often discard) all of them,
+  // intermittently losing most "CDK:..." frames sent over USB. See repo
+  // memory for the full investigation.
+  {
+    int avail = Serial.available();
+    if (avail > 0) {
+      Serial.printf("[USBRX-DIAG] Serial.available()=%d\n", avail);
     }
-    else if (c != '\r') usbInBuf += c;
+    static unsigned long lastHeapPrintMs = 0;
+    if (millis() - lastHeapPrintMs > 3000) {
+      lastHeapPrintMs = millis();
+      Serial.printf("[HEAP-DIAG] freeHeap=%u minFreeHeap=%u largestFreeBlock=%u\n",
+                    ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getMaxAllocHeap());
+    }
+  }
+
+  // BLE incoming -- queued by RxCallbacks::onWrite() on the NimBLE host
+  // task; drained and processed here on the main task's larger stack.
+  while (true) {
+    String frame;
+    bool got = false;
+    portENTER_CRITICAL(&bleFrameQueueMux);
+    if (blePendingCount > 0) {
+      frame = blePendingFrames[blePendingHead];
+      blePendingHead = (blePendingHead + 1) % 4;
+      blePendingCount--;
+      got = true;
+    }
+    portEXIT_CRITICAL(&bleFrameQueueMux);
+    if (!got) break;
+    handleFrame(frame);
   }
 
   // BLE advertising suppressed while a USB serial phone session is active.
@@ -1101,7 +1238,153 @@ static bool isDuplicateMTalk(const String& senderId, const String& mid) {
     return false;
 }
 
- void handleDuckData(CdpPacket packet) {
+ // Services a GPS location request, whether it arrived via the dedicated
+// GPS topic (topics::gps = 0xEA, see case 234 in handleDuckData() below) or
+// via a "CMD:GPS_REQUEST" text command inside an authenticated encrypted_cmd
+// payload (see topics::encrypted_cmd in handleDuckData() below). The latter
+// path is deliberately NOT reachable from any plaintext topic -- this is the
+// exact action a rogue "operator" would want to trigger to exfiltrate a
+// duck's live location, so it must only run after duckcrypto::decryptFromPeer()
+// has verified the request came from whoever holds OpenDMS's static private
+// key. Reports hardware GPS (Heltec V4 only) if available, otherwise
+// requests location from a connected phone, otherwise reports no-fix.
+void handleGpsRequestCommand() {
+    Serial.println("[GPS] Location request received");
+#ifdef ARDUINO_heltec_wifi_lora_32_V4
+    if (tinyGps.location.isValid()) {
+      // Hardware GPS is the priority source — send regardless of fix age.
+      float altM  = tinyGps.altitude.isValid() ? tinyGps.altitude.meters()  : 0.0f;
+      float spdKh = tinyGps.speed.isValid()    ? tinyGps.speed.kmph()        : 0.0f;
+      float hdgDeg = tinyGps.course.isValid()  ? tinyGps.course.deg()        : 0.0f;
+      duckcdp_GpsReading reading = duckcdp_GpsReading_init_zero;
+      reading.has_fix = true;
+      reading.source = duckcdp_GpsSource_GPS_SOURCE_DEVICE;
+      reading.no_fix_reason = duckcdp_GpsNoFixReason_GPS_REASON_NONE;
+      reading.lat_e7 = (int32_t)lround(tinyGps.location.lat() * 1e7);
+      reading.lng_e7 = (int32_t)lround(tinyGps.location.lng() * 1e7);
+      reading.alt_m = (int32_t)lround(altM);
+      reading.spd_dkmh = (uint32_t)lround(spdKh * 10);
+      reading.hdg_deg = (uint32_t)lround(hdgDeg);
+      reading.sats = tinyGps.satellites.value();
+      reading.batt_pct = heltec_battery_percent(readVbat());
+      reading.rssi_dbm = currentRssiDbm();
+      std::vector<uint8_t> encoded = duckpayload::encodeGps(reading);
+      // Show transmission status on OLED before sending — matches
+      // WioTrackerL1's GPS-request display layout (BATT/ID header,
+      // "sending" line, LAT, LNG; no raw wire-format telemetry line).
+      display.displayOn();
+      display.clear();
+      display.setFont(ArialMT_Plain_10);
+      display.setTextAlignment(TEXT_ALIGN_LEFT);
+      display.drawString(0, 0, TXT_BATT_LABEL + String(heltec_battery_percent(readVbat())) + "%");
+      display.setTextAlignment(TEXT_ALIGN_RIGHT);
+      display.drawString(128, 0, buffer);
+      display.setTextAlignment(TEXT_ALIGN_LEFT);
+      display.drawString(0, 14, TXT_SENDING_GPS_DATA);
+      display.drawString(0, 28, "LAT:" + String(tinyGps.location.lat(), 5));
+      display.drawString(0, 40, "LNG:" + String(tinyGps.location.lng(), 5));
+      display.display();
+      sendUplink(topics::gps, std::string(reinterpret_cast<const char*>(encoded.data()), encoded.size()));
+      Serial.printf("[GPS] Hardware GPS sent (age: %lums, %u bytes)\n",
+                    tinyGps.location.age(), (unsigned)encoded.size());
+      // Non-blocking display clear — delay() here would block duck.run() for
+      // 3 s, causing the SX1262 FIFO to fill up and corrupt queued packets.
+      gpsDisplayClearMs = millis() + 3000;
+    } else {
+      // No hardware fix — request from phone if connected, else report to mesh.
+      bool phoneConnected = isPhoneConnected();
+      Serial.printf("[GPS] No hardware fix (module %s) — phone %s\n",
+                    gpsModuleDetected ? "detected, awaiting fix" : "not detected",
+                    phoneConnected ? "connected, requesting" : "not connected");
+      display.displayOn();
+      display.clear();
+      display.setFont(ArialMT_Plain_10);
+      display.setTextAlignment(TEXT_ALIGN_LEFT);
+      display.drawString(0, 0, TXT_BATT_LABEL + String(heltec_battery_percent(readVbat())) + "%");
+      display.setTextAlignment(TEXT_ALIGN_RIGHT);
+      display.drawString(128, 0, buffer);
+      display.setTextAlignment(TEXT_ALIGN_CENTER);
+      if (phoneConnected) {
+        display.drawString(64, 28, TXT_REQ_GPS_DATA_FROM_PHONE_2L);
+        display.display();
+        // Defer CDK:GPSREQ — sending it immediately after CDK:SEEN causes Android's
+        // BLE stack to silently drop one of the two rapid-succession notifications.
+        // The main loop sends it 400 ms later, after CDK:SEEN has been processed.
+        if (gpsReqDeferredSendMs == 0) {
+          gpsReqDeferredSendMs = millis() + 400;
+        }
+      } else {
+        display.drawString(64, 28, TXT_NO_PHONE_NO_GPS_2L);
+        display.display();
+        duckcdp_GpsReading noGps = duckcdp_GpsReading_init_zero;
+        noGps.has_fix = false;
+        noGps.source = duckcdp_GpsSource_GPS_SOURCE_NONE;
+        noGps.no_fix_reason = duckcdp_GpsNoFixReason_GPS_REASON_NO_RESPONSE;
+        noGps.batt_pct = heltec_battery_percent(readVbat());
+        noGps.rssi_dbm = currentRssiDbm();
+        std::vector<uint8_t> encoded = duckpayload::encodeGps(noGps);
+        sendUplink(topics::gps, std::string(reinterpret_cast<const char*>(encoded.data()), encoded.size()));
+        Serial.println("[GPS] No phone connected — sent no-fix protobuf report.");
+      }
+      // Non-blocking display clear — delay() here blocks duck.run() for 2 s,
+      // preventing the radio from reading queued packets and corrupting the
+      // SX1262 FIFO when a second packet arrives before the first is read.
+      gpsDisplayClearMs = millis() + 2000;
+    }
+#else
+    // No GPS hardware on this board — request from phone if connected, else report to mesh.
+    {
+      bool phoneConnected = isPhoneConnected();
+      Serial.printf("[GPS] No GPS hardware — phone %s, cache %s\n",
+                    phoneConnected ? "connected" : "not connected",
+                    phoneGpsLatBuf[0] != '\0' ? "hot" : "empty");
+      display.displayOn();
+      display.clear();
+      display.setFont(ArialMT_Plain_10);
+      display.setTextAlignment(TEXT_ALIGN_LEFT);
+      display.drawString(0, 0, TXT_BATT_LABEL + String(heltec_battery_percent(readVbat())) + "%");
+      display.setTextAlignment(TEXT_ALIGN_RIGHT);
+      display.drawString(128, 0, buffer);
+      display.setTextAlignment(TEXT_ALIGN_CENTER);
+      if (phoneConnected) {
+        if (phoneGpsLatBuf[0] != '\0') {
+          // Cache hot — will respond immediately from cache in deferred dispatch
+          display.setTextAlignment(TEXT_ALIGN_LEFT);
+          display.drawString(0, 14, TXT_SENDING_GPS_DATA);
+          display.drawString(0, 28, "LAT:" + String(phoneGpsLatBuf));
+          display.drawString(0, 42, "LNG:" + String(phoneGpsLngBuf));
+        } else {
+          display.drawString(64, 28, TXT_REQ_GPS_DATA_FROM_PHONE_2L);
+        }
+        display.display();
+        // Defer GPS response — sending immediately after CDK:SEEN causes Android's
+        // BLE stack to silently drop one of the two rapid-succession notifications.
+        // The main loop sends GPSREQ (or uses cache) 400 ms later.
+        if (gpsReqDeferredSendMs == 0) {
+          gpsReqDeferredSendMs = millis() + 400;
+        }
+      } else {
+        display.drawString(64, 28, TXT_NO_PHONE_NO_GPS_2L);
+        display.display();
+        duckcdp_GpsReading noGps = duckcdp_GpsReading_init_zero;
+        noGps.has_fix = false;
+        noGps.source = duckcdp_GpsSource_GPS_SOURCE_NONE;
+        noGps.no_fix_reason = duckcdp_GpsNoFixReason_GPS_REASON_NO_RESPONSE;
+        noGps.batt_pct = heltec_battery_percent(readVbat());
+        noGps.rssi_dbm = currentRssiDbm();
+        std::vector<uint8_t> encoded = duckpayload::encodeGps(noGps);
+        sendUplink(topics::gps, std::string(reinterpret_cast<const char*>(encoded.data()), encoded.size()));
+        Serial.println("[GPS] No phone connected — sent no-fix protobuf report.");
+      }
+      // Non-blocking display clear — delay() here blocks duck.run() for 2 s,
+      // preventing the radio from reading queued packets and corrupting the
+      // SX1262 FIFO when a second packet arrives before the first is read.
+      gpsDisplayClearMs = millis() + 2000;
+    }
+#endif
+}
+
+void handleDuckData(CdpPacket packet) {
     bool isForMe = (memcmp(packet.dduid.data(), duck.getDuckId().data(), 8) == 0);
     bool isBroadcast = (packet.dduid[0] == 0xFF);
     bool beaconAuthenticated = false;
@@ -1329,6 +1612,17 @@ static bool isDuplicateMTalk(const String& senderId, const String& mid) {
                 Serial.println("[MAMA] SOS acknowledged by operator");
                 break;
             }
+            // GPS_REQUEST is a privileged remote-location request -- only honor it
+            // when it arrived via the authenticated encrypted_cmd channel (topic 8),
+            // never via the forgeable plaintext dcmd (topic 22). Without this check
+            // the raw "CMD:GPS_REQUEST" command text fell through to the generic
+            // message handler below and was shown on screen / forwarded to the
+            // phone as if it were an operator chat message.
+            if (packet.topic == topics::encrypted_cmd && message.indexOf("CMD:GPS_REQUEST") >= 0) {
+                Serial.println("[GPS] CMD:GPS_REQUEST received from operator");
+                handleGpsRequestCommand();
+                break;
+            }
             display.displayOn();
             displayMessage(message);
             emergencyDisplayPending = true;   // operator message — stay until button pressed
@@ -1424,142 +1718,9 @@ static bool isDuplicateMTalk(const String& senderId, const String& mid) {
             broadcast(String("CDK:PMSG,TEXT:") + message);
             break;
 
-        case 234: {  // GPS location request (topics::gps = 0xEA)
-            Serial.println("[GPS] Location request received");
-#ifdef ARDUINO_heltec_wifi_lora_32_V4
-            if (tinyGps.location.isValid()) {
-              // Hardware GPS is the priority source — send regardless of fix age.
-              float altM  = tinyGps.altitude.isValid() ? tinyGps.altitude.meters()  : 0.0f;
-              float spdKh = tinyGps.speed.isValid()    ? tinyGps.speed.kmph()        : 0.0f;
-              float hdgDeg = tinyGps.course.isValid()  ? tinyGps.course.deg()        : 0.0f;
-              duckcdp_GpsReading reading = duckcdp_GpsReading_init_zero;
-              reading.has_fix = true;
-              reading.source = duckcdp_GpsSource_GPS_SOURCE_DEVICE;
-              reading.no_fix_reason = duckcdp_GpsNoFixReason_GPS_REASON_NONE;
-              reading.lat_e7 = (int32_t)lround(tinyGps.location.lat() * 1e7);
-              reading.lng_e7 = (int32_t)lround(tinyGps.location.lng() * 1e7);
-              reading.alt_m = (int32_t)lround(altM);
-              reading.spd_dkmh = (uint32_t)lround(spdKh * 10);
-              reading.hdg_deg = (uint32_t)lround(hdgDeg);
-              reading.sats = tinyGps.satellites.value();
-              reading.batt_pct = heltec_battery_percent(readVbat());
-              reading.rssi_dbm = currentRssiDbm();
-              std::vector<uint8_t> encoded = duckpayload::encodeGps(reading);
-              // Show transmission status on OLED before sending — matches
-              // WioTrackerL1's GPS-request display layout (BATT/ID header,
-              // "sending" line, LAT, LNG; no raw wire-format telemetry line).
-              display.displayOn();
-              display.clear();
-              display.setFont(ArialMT_Plain_10);
-              display.setTextAlignment(TEXT_ALIGN_LEFT);
-              display.drawString(0, 0, TXT_BATT_LABEL + String(heltec_battery_percent(readVbat())) + "%");
-              display.setTextAlignment(TEXT_ALIGN_RIGHT);
-              display.drawString(128, 0, buffer);
-              display.setTextAlignment(TEXT_ALIGN_LEFT);
-              display.drawString(0, 14, TXT_SENDING_GPS_DATA);
-              display.drawString(0, 28, "LAT:" + String(tinyGps.location.lat(), 5));
-              display.drawString(0, 40, "LNG:" + String(tinyGps.location.lng(), 5));
-              display.display();
-              sendUplink(topics::gps, std::string(reinterpret_cast<const char*>(encoded.data()), encoded.size()));
-              Serial.printf("[GPS] Hardware GPS sent (age: %lums, %u bytes)\n",
-                            tinyGps.location.age(), (unsigned)encoded.size());
-              // Non-blocking display clear — delay() here would block duck.run() for
-              // 3 s, causing the SX1262 FIFO to fill up and corrupt queued packets.
-              gpsDisplayClearMs = millis() + 3000;
-            } else {
-              // No hardware fix — request from phone if connected, else report to mesh.
-              bool phoneConnected = isPhoneConnected();
-              Serial.printf("[GPS] No hardware fix (module %s) — phone %s\n",
-                            gpsModuleDetected ? "detected, awaiting fix" : "not detected",
-                            phoneConnected ? "connected, requesting" : "not connected");
-              display.displayOn();
-              display.clear();
-              display.setFont(ArialMT_Plain_10);
-              display.setTextAlignment(TEXT_ALIGN_LEFT);
-              display.drawString(0, 0, TXT_BATT_LABEL + String(heltec_battery_percent(readVbat())) + "%");
-              display.setTextAlignment(TEXT_ALIGN_RIGHT);
-              display.drawString(128, 0, buffer);
-              display.setTextAlignment(TEXT_ALIGN_CENTER);
-              if (phoneConnected) {
-                display.drawString(64, 28, TXT_REQ_GPS_DATA_FROM_PHONE_2L);
-                display.display();
-                // Defer CDK:GPSREQ — sending it immediately after CDK:SEEN causes Android's
-                // BLE stack to silently drop one of the two rapid-succession notifications.
-                // The main loop sends it 400 ms later, after CDK:SEEN has been processed.
-                if (gpsReqDeferredSendMs == 0) {
-                  gpsReqDeferredSendMs = millis() + 400;
-                }
-              } else {
-                display.drawString(64, 28, TXT_NO_PHONE_NO_GPS_2L);
-                display.display();
-                duckcdp_GpsReading noGps = duckcdp_GpsReading_init_zero;
-                noGps.has_fix = false;
-                noGps.source = duckcdp_GpsSource_GPS_SOURCE_NONE;
-                noGps.no_fix_reason = duckcdp_GpsNoFixReason_GPS_REASON_NO_RESPONSE;
-                noGps.batt_pct = heltec_battery_percent(readVbat());
-                noGps.rssi_dbm = currentRssiDbm();
-                std::vector<uint8_t> encoded = duckpayload::encodeGps(noGps);
-                sendUplink(topics::gps, std::string(reinterpret_cast<const char*>(encoded.data()), encoded.size()));
-                Serial.println("[GPS] No phone connected — sent no-fix protobuf report.");
-              }
-              // Non-blocking display clear — delay() here blocks duck.run() for 2 s,
-              // preventing the radio from reading queued packets and corrupting the
-              // SX1262 FIFO when a second packet arrives before the first is read.
-              gpsDisplayClearMs = millis() + 2000;
-            }
-#else
-            // No GPS hardware on this board — request from phone if connected, else report to mesh.
-            {
-              bool phoneConnected = isPhoneConnected();
-              Serial.printf("[GPS] No GPS hardware — phone %s, cache %s\n",
-                            phoneConnected ? "connected" : "not connected",
-                            phoneGpsLatBuf[0] != '\0' ? "hot" : "empty");
-              display.displayOn();
-              display.clear();
-              display.setFont(ArialMT_Plain_10);
-              display.setTextAlignment(TEXT_ALIGN_LEFT);
-              display.drawString(0, 0, TXT_BATT_LABEL + String(heltec_battery_percent(readVbat())) + "%");
-              display.setTextAlignment(TEXT_ALIGN_RIGHT);
-              display.drawString(128, 0, buffer);
-              display.setTextAlignment(TEXT_ALIGN_CENTER);
-              if (phoneConnected) {
-                if (phoneGpsLatBuf[0] != '\0') {
-                  // Cache hot — will respond immediately from cache in deferred dispatch
-                  display.setTextAlignment(TEXT_ALIGN_LEFT);
-                  display.drawString(0, 14, TXT_SENDING_GPS_DATA);
-                  display.drawString(0, 28, "LAT:" + String(phoneGpsLatBuf));
-                  display.drawString(0, 42, "LNG:" + String(phoneGpsLngBuf));
-                } else {
-                  display.drawString(64, 28, TXT_REQ_GPS_DATA_FROM_PHONE_2L);
-                }
-                display.display();
-                // Defer GPS response — sending immediately after CDK:SEEN causes Android's
-                // BLE stack to silently drop one of the two rapid-succession notifications.
-                // The main loop sends GPSREQ (or uses cache) 400 ms later.
-                if (gpsReqDeferredSendMs == 0) {
-                  gpsReqDeferredSendMs = millis() + 400;
-                }
-              } else {
-                display.drawString(64, 28, TXT_NO_PHONE_NO_GPS_2L);
-                display.display();
-                duckcdp_GpsReading noGps = duckcdp_GpsReading_init_zero;
-                noGps.has_fix = false;
-                noGps.source = duckcdp_GpsSource_GPS_SOURCE_NONE;
-                noGps.no_fix_reason = duckcdp_GpsNoFixReason_GPS_REASON_NO_RESPONSE;
-                noGps.batt_pct = heltec_battery_percent(readVbat());
-                noGps.rssi_dbm = currentRssiDbm();
-                std::vector<uint8_t> encoded = duckpayload::encodeGps(noGps);
-                sendUplink(topics::gps, std::string(reinterpret_cast<const char*>(encoded.data()), encoded.size()));
-                Serial.println("[GPS] No phone connected — sent no-fix protobuf report.");
-              }
-              // Non-blocking display clear — delay() here blocks duck.run() for 2 s,
-              // preventing the radio from reading queued packets and corrupting the
-              // SX1262 FIFO when a second packet arrives before the first is read.
-              gpsDisplayClearMs = millis() + 2000;
-            }
-#endif
+        case 234:  // GPS location request (topics::gps = 0xEA)
+            handleGpsRequestCommand();
             break;
-        }
 
         case TOPIC_BEACON: {  // 27 — combined discovery + GPS beacon
             if (meshgroupconfig::isConfigured() && !beaconAuthenticated) {
@@ -1968,6 +2129,18 @@ void displayAnnouncement(const String& msg) {
 }
 
 // ── Frame dispatcher ────────────────────────────────────────────────
+// Registered with duck.setOnUnhandledSerialLine() in setup() -- see that
+// call site's comment for why Duck::run() must be the only code reading
+// Serial directly.
+void onUsbSerialLine(const String& line) {
+  lastUsbRxMs = millis();  // mark USB as active
+  if (line.startsWith("CDK:")) {
+    if (!usbPhoneSeen) usbConnectDisplayPending = true;  // first CDK frame → show splash
+    usbPhoneSeen = true;  // phone sent a valid frame
+  }
+  handleFrame(line);
+}
+
 void handleFrame(const String& line) {
   if (!line.startsWith("CDK:")) return;  // ignore noise
 

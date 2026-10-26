@@ -3,6 +3,7 @@
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <functional>
 #include "../utils/DuckError.h"
 #include "../include/cdpcfg.h"
 #include "../radio/DuckLoRa.h"
@@ -64,9 +65,7 @@ class Duck {
         }
       }
       Duck::logIfLowMemory();
-      opendmsconfig::checkSerialProvisioning();
-      meshgroupconfig::checkSerialProvisioning();
-      radioregionconfig::checkSerialProvisioning();
+      checkSerialProvisioning();
       if(router.getNetworkState() == NetworkState::PUBLIC) {
         if(duckRadio.getReceiveFlag()){
           handleReceivedPacket();
@@ -86,8 +85,20 @@ class Duck {
 
     }
 
-    int setupWithDefaults() {
-      this->setupSerial(115200);
+    /**
+     * @brief Set up a MamaDuck/PapaDuck/etc with sane defaults.
+     * @param skipSerialInit set true when the board-support layer (e.g.
+     *        heltec_setup()) has already called Serial.begin() for this
+     *        board -- calling it again here re-initializes the UART and
+     *        silently breaks host->device RX (TX keeps working, which
+     *        makes this very hard to spot). Boards that don't already
+     *        initialize Serial themselves should leave this false so
+     *        setupSerial() still runs as before.
+     */
+    int setupWithDefaults(bool skipSerialInit = false) {
+      if (!skipSerialInit) {
+        this->setupSerial(115200);
+      }
       int err = duckidentity::begin();
       if (err != DUCK_ERR_NONE) {
         logerr_ln("ERROR setupWithDefaults failed to initialize DuckIdentity rc = %d", err);
@@ -434,6 +445,29 @@ class Duck {
     }
 
     /**
+     * @brief Register a callback for serial lines that none of the built-in
+     * provisioning modules (OpenDmsConfig/MeshGroupConfig/RadioRegionConfig)
+     * recognize -- e.g. application-level frames like "CDK:...".
+     *
+     * Duck::run() is the ONLY code that reads Serial.available()/Serial.read()
+     * on behalf of this Duck: it owns buffering a complete line and trying
+     * each provisioning module's AT+ command syntax in turn. Previously, the
+     * three provisioning modules and application sketches each ran their own
+     * independent `while (Serial.available())` drain loop, which raced with
+     * each other for the same incoming bytes -- whichever one happened to
+     * run in the loop() iteration where bytes arrived would silently consume
+     * (and, if unrecognized, discard) all of them, causing host->device
+     * serial data to be intermittently and silently lost. Register a
+     * callback here instead of reading Serial directly in application code.
+     *
+     * @param callback invoked with one complete line (no trailing \n/\r)
+     * whenever Duck::run() reads one that no provisioning module recognized.
+     */
+    void setOnUnhandledSerialLine(std::function<void(const String&)> callback) {
+      onUnhandledSerialLine_ = callback;
+    }
+
+    /**
      * @brief Whether this Duck has already learned a peer's long-term
      * X25519 public key (via a received identity_announce -- see
      * learnPeerIdentity()). sendEncryptedData()/sendMamaLink() consult the
@@ -515,6 +549,12 @@ class Duck {
     /// eviction) until a reboot. Small mesh deployments only.
     static constexpr size_t MAX_PEER_IDENTITIES = 16;
     std::unordered_map<std::string, std::array<uint8_t, duckcrypto::PUBLIC_KEY_LENGTH>> peerIdentities;
+
+    /// Line buffer + app callback for checkSerialProvisioning()'s
+    /// centralized Serial reader -- see setOnUnhandledSerialLine().
+    static constexpr size_t MAX_SERIAL_LINE_LENGTH = 128;
+    std::string serialLineBuffer_;
+    std::function<void(const String&)> onUnhandledSerialLine_;
 
     /**
      * @brief Record a peer's long-term public key, learned via a received
@@ -932,6 +972,44 @@ class Duck {
     Duck& operator=(Duck const&) = delete;
 
     /**
+     * @brief Read, buffer and dispatch ONE complete line at a time from
+     * Serial, trying each built-in provisioning module's AT+ command
+     * syntax in turn, falling back to the app-registered
+     * onUnhandledSerialLine_ callback (see setOnUnhandledSerialLine())
+     * for anything none of them recognize.
+     *
+     * This is the single, centralized Serial reader for the whole Duck --
+     * see setOnUnhandledSerialLine()'s doc comment for why having more
+     * than one piece of code independently call Serial.available()/
+     * Serial.read() is unsafe.
+     *
+     * Non-blocking: returns immediately once no more bytes are currently
+     * available. Called once per Duck::run() iteration.
+     */
+    void checkSerialProvisioning() {
+      while (Serial.available() > 0) {
+        char c = static_cast<char>(Serial.read());
+        if (c == '\n' || c == '\r') {
+          if (!serialLineBuffer_.empty()) {
+            if (!opendmsconfig::tryHandleSerialLine(serialLineBuffer_) &&
+                !meshgroupconfig::tryHandleSerialLine(serialLineBuffer_) &&
+                !radioregionconfig::tryHandleSerialLine(serialLineBuffer_)) {
+              if (onUnhandledSerialLine_) {
+                onUnhandledSerialLine_(String(serialLineBuffer_.c_str()));
+              }
+            }
+            serialLineBuffer_.clear();
+          }
+        } else {
+          serialLineBuffer_ += c;
+          if (serialLineBuffer_.size() > MAX_SERIAL_LINE_LENGTH) {
+            serialLineBuffer_.clear();
+          }
+        }
+      }
+    }
+
+    /**
      * @brief Read packets from CDP nodes responding to our network join request
      * @returns Optional<CdpPacket> if network join response is found, nullopt if not 
      */
@@ -975,7 +1053,7 @@ class Duck {
         router.getFilter().assignUniqueMessageId(txPacket);
         err = txPacket.prepareForSending();
         if (err != DUCK_ERR_NONE) {
-          logerr_ln("ERROR Failed to build packet, err = " + err);
+          logerr_ln("ERROR Failed to build packet, err = %d", err);
           return err;
         }
         err = duckRadio.sendData(txPacket.asBytes());
@@ -1012,7 +1090,7 @@ class Duck {
     int sendToRadio(CdpPacket& txPacket) {
       int err = txPacket.prepareForSending();
       if (err != DUCK_ERR_NONE) {
-        logerr_ln("ERROR Failed to build ping packet, err = " + err);
+        logerr_ln("ERROR Failed to build ping packet, err = %d", err);
         return err;
       }
 

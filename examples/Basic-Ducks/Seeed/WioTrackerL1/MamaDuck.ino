@@ -280,7 +280,6 @@ static void setupBLE();
 static void bleSendLine(const String& line);
 
 // ── USB Serial state ──────────────────────────────────────────────────────────
-static String         usbInBuf            = "";
 static unsigned long  lastUsbRxMs         = 0;
 static bool           usbPhoneSeen        = false;
 const  unsigned long  USB_IDLE_TIMEOUT_MS = 30000UL;
@@ -295,6 +294,8 @@ static volatile bool  gpsLoraOk                  = false;
 static volatile bool  gpsTxPending               = false;
 static volatile bool  usbConnectDisplayPending   = false;
 static volatile bool  usbDisconnectDisplayPending= false;
+static volatile bool  bleConnectDisplayPending   = false;
+static volatile bool  bleDisconnectDisplayPending= false;
 static volatile bool  sosAckDisplayPending       = false;
 
 // ── SOS state (non-blocking) ─────────────────────────────────────────────────
@@ -376,6 +377,7 @@ void displayID();
 void displayBatt();
 void flashLED();
 void handleFrame(const String& line);
+void onUsbSerialLine(const String& line);
 void broadcast(const String& frame);
 void sendBattery();
 void handleSOS(const String& body);
@@ -469,7 +471,7 @@ extern "C" void HardFault_Handler(void) {
 
 static void ble_on_connect(uint16_t /*conn_handle*/) {
     blePhoneSeen = true;
-    usbConnectDisplayPending = true;
+    bleConnectDisplayPending = true;
     Serial.println("[BLE] connected"); Serial.flush();
     broadcast(String("CDK:ID,VALUE:") + DUCK_ID_BUF);
     sendBattery();
@@ -477,7 +479,7 @@ static void ble_on_connect(uint16_t /*conn_handle*/) {
 
 static void ble_on_disconnect(uint16_t /*conn_handle*/, uint8_t reason) {
     blePhoneSeen = false;
-    usbDisconnectDisplayPending = true;
+    bleDisconnectDisplayPending = true;
     bleInLen = 0;
     Serial.printf("[BLE] disconnected reason=0x%02X\n", reason); Serial.flush();
 }
@@ -835,6 +837,7 @@ void setup() {
     }
     duck.goPublic();
     duck.onReceiveDuckData(handleDuckData);
+    duck.setOnUnhandledSerialLine(onUsbSerialLine);
     setupOK = true;
     snprintf(idBuf, sizeof(idBuf), "ID:%s", DUCK_NAME);
 
@@ -963,6 +966,31 @@ void loop() {
         displayHome();
     }
 
+    // BLE connected / disconnected splashes.
+    if (bleConnectDisplayPending) {
+        bleConnectDisplayPending = false;
+        dspPowerSave(0);
+        dspBegin();
+        dspStrRight(0, idBuf);
+        dspStrCenter(26, TXT_BLUETOOTH);
+        dspStrCenter(38, TXT_CONNECTED_BANG);
+        dspEnd();
+        delay(2000);
+        displayHome();
+    }
+    if (bleDisconnectDisplayPending) {
+        bleDisconnectDisplayPending = false;
+        dspPowerSave(0);
+        displayEnabled = true;
+        dspBegin();
+        dspStrRight(0, idBuf);
+        dspStrCenter(26, TXT_BLUETOOTH);
+        dspStrCenter(38, TXT_DISCONNECTED);
+        dspEnd();
+        delay(2000);
+        displayHome();
+    }
+
     // SOS acknowledgement from operator — show for SOS_ACK_DISPLAY_MS then auto-return home.
     if (sosAckDisplayPending) {
         sosAckDisplayPending = false;
@@ -988,7 +1016,7 @@ void loop() {
 
     // Auto-refresh home screen.
     if (displayEnabled && !phoneGpsDisplayPending
-        && !usbConnectDisplayPending && !messagePending && !emergencyDisplayPending
+        && !usbConnectDisplayPending && !bleConnectDisplayPending && !messagePending && !emergencyDisplayPending
         && sosAckUntilMs == 0
         && (millis() - lastHomeRefreshMs >= HOME_REFRESH_MS)) {
         lastHomeRefreshMs = millis();
@@ -1182,6 +1210,34 @@ void loop() {
     // ── USB discovery / incoming ───────────────────────────────────────────────
     {
         static unsigned long lastUsbAnnounceMs = 0;
+        static bool          usbDtrWasAsserted  = false;
+
+        // The host (PC terminal or phone app) asserts DTR the moment it opens
+        // the serial port -- this is a real, immediate "USB connected" edge,
+        // unlike the free-running 3s announce timer below which is not
+        // synchronized to when the port was actually opened. A phone app with
+        // a short connect timeout can open the port, see nothing for up to
+        // ~3s, and give up ("connection error, retry") before the next
+        // periodic announce ever fires. React to the DTR rising edge the same
+        // way ble_on_connect() reacts to a BLE connection: announce
+        // immediately. See also CDK_PROTOCOL.md, which documents CDK:ID as
+        // being sent "on BLE connect, USB connect".
+        bool usbDtrNow = Serial.dtr();
+        if (usbDtrNow && !usbDtrWasAsserted) {
+            Serial.println(String("CDK:ID,VALUE:") + DUCK_ID_BUF);
+            sendBattery();
+            lastBattMs             = millis();
+            lastUsbAnnounceMs      = millis();
+            usbConnectDisplayPending = true;
+        } else if (!usbDtrNow && usbDtrWasAsserted && usbPhoneSeen) {
+            // Host closed the port (app backgrounded/retry/disconnect) --
+            // don't wait out the full idle timeout before reflecting that.
+            usbPhoneSeen                = false;
+            lastUsbAnnounceMs           = 0;
+            usbDisconnectDisplayPending = true;
+        }
+        usbDtrWasAsserted = usbDtrNow;
+
         if (usbPhoneSeen && lastUsbRxMs > 0 && millis() - lastUsbRxMs > USB_IDLE_TIMEOUT_MS) {
             usbPhoneSeen             = false;
             lastUsbAnnounceMs        = 0;
@@ -1221,20 +1277,13 @@ void loop() {
         }
     }
 
-    while (Serial.available()) {
-        lastUsbRxMs = millis();
-        char c = Serial.read();
-        if (c == '\n') {
-            if (usbInBuf.startsWith("CDK:")) {
-                if (!usbPhoneSeen) usbConnectDisplayPending = true;
-                usbPhoneSeen = true;
-            }
-            handleFrame(usbInBuf);
-            usbInBuf = "";
-        } else if (c != '\r') {
-            usbInBuf += c;
-        }
-    }
+    // USB CDK: frame reading is centralized in Duck::run()'s single Serial
+    // dispatcher (see onUsbSerialLine(), registered via
+    // duck.setOnUnhandledSerialLine() in setup()) to avoid racing with the
+    // AT+ provisioning readers (OpenDmsConfig/MeshGroupConfig/RadioRegionConfig)
+    // that also run inside duck.run() -- having two independent
+    // Serial.available()/Serial.read() drain loops caused intermittent host->
+    // device RX byte loss (same bug class fixed on Heltec's MamaDuck.ino).
 
     // Periodic battery update every 60 s.
     if (millis() - lastBattMs >= 60000UL) {
@@ -2077,6 +2126,15 @@ void broadcast(const String& frame) {
 }
 
 // ── Frame dispatcher ──────────────────────────────────────────────────────────
+void onUsbSerialLine(const String& line) {
+    lastUsbRxMs = millis();
+    if (line.startsWith("CDK:")) {
+        if (!usbPhoneSeen) usbConnectDisplayPending = true;
+        usbPhoneSeen = true;
+    }
+    handleFrame(line);
+}
+
 void handleFrame(const String& line) {
     if (!line.startsWith("CDK:")) return;
     broadcast(String("CDK:ID,VALUE:") + DUCK_ID_BUF);

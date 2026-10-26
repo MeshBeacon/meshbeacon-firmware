@@ -102,7 +102,11 @@
 //#define CDPCFG_RF_LORA_SF 7
 #define CDPCFG_RF_LORA_SF 9
 /// Transmit Power
+// Guarded so a board file (included above) can override this before the
+// default is applied, e.g. to diagnose/mitigate TX-current-induced resets.
+#ifndef CDPCFG_RF_LORA_TXPOW
 #define CDPCFG_RF_LORA_TXPOW 14
+#endif
 /// Antenna Gain correction
 #define CDPCFG_RF_LORA_GAIN 0
 

@@ -20,7 +20,7 @@
  *    the real deployment's key before flashing.
  *  - field provisioning: begin() loads a previously field-provisioned key
  *    from flash if one was written via the serial provisioning command
- *    (see checkSerialProvisioning()). Overrides the build-flag/compile-time
+ *    (see tryHandleSerialLine()). Overrides the build-flag/compile-time
  *    value if present.
  * Unlike OpenDMS's static public key, this key IS secret -- anyone holding
  * it can both encrypt and decrypt group broadcast traffic -- so it should
@@ -37,6 +37,7 @@
 #define MESHGROUPCONFIG_H_
 
 #include <stdint.h>
+#include <string>
 #include "DuckCrypto.h"
 
 namespace meshgroupconfig {
@@ -68,7 +69,7 @@ bool isConfigured();
 /**
  * @brief Field-provision the mesh group key over the USB serial console.
  *
- * Polls Serial for a complete line and, if present, handles one of:
+ * Handles one complete line at a time, recognizing one of:
  *  - "AT+MESHKEY=<64 hex chars>": sets MESH_GROUP_KEY and persists it to
  *    flash. Only succeeds while isConfigured() is false, to prevent a
  *    stray write from silently reassigning an already provisioned
@@ -78,9 +79,20 @@ bool isConfigured();
  *    clears MESH_GROUP_KEY back to all-zero.
  *  - "AT+MESHKEY?": logs whether a key is currently configured, and if
  *    so, its hex form.
- * Should be polled once per main loop iteration.
+ *
+ * Does NOT read Serial itself -- callers (Duck::run()'s centralized
+ * serial line reader) own reading/buffering Serial and pass each
+ * completed line here. This keeps there from being multiple independent
+ * competing Serial.read() consumers, which previously raced with each
+ * other (and with application code) and silently dropped host->device
+ * bytes.
+ *
+ * @param line a complete line read from Serial (no trailing \\n/\\r).
+ * @return true if this line matched one of this module's commands and
+ *         was handled, false if it was not recognized (caller should try
+ *         another handler, or treat it as application data).
  */
-void checkSerialProvisioning();
+bool tryHandleSerialLine(const std::string& line);
 
 } // namespace meshgroupconfig
 

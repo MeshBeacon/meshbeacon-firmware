@@ -53,12 +53,6 @@ constexpr int EEPROM_TOTAL_SIZE = 536;
 constexpr uint8_t KEY_MAGIC = 0xDA; // "Duck Agency key"
 
 constexpr size_t KEY_HEX_LENGTH = duckcrypto::PUBLIC_KEY_LENGTH * 2;
-// Generous bound on a serial provisioning line's length, well above the
-// longest valid command ("AT+OPENDMSKEY=" + 64 hex chars), just to keep
-// stray/unterminated line noise from growing this buffer unbounded.
-constexpr size_t MAX_SERIAL_LINE_LENGTH = 128;
-
-std::string serialLineBuffer;
 
 // CRC-8-CCITT (poly 0x07) over the stored public key, used only to detect
 // flash/file corruption -- NOT a security/authentication primitive (this
@@ -211,7 +205,7 @@ std::string hexEncodeKey(const uint8_t* key) {
   return out;
 }
 
-void handleSerialLine(const std::string& line) {
+bool handleSerialLine(const std::string& line) {
   static const std::string WRITE_PREFIX = "AT+OPENDMSKEY=";
   static const std::string RESET_CMD = "AT+OPENDMSKEY+RESET";
   static const std::string QUERY_CMD = "AT+OPENDMSKEY?";
@@ -223,7 +217,7 @@ void handleSerialLine(const std::string& line) {
     } else {
       loginfo_ln("OpenDmsConfig: not configured (all-zero placeholder)");
     }
-    return;
+    return true;
   }
 
   if (line == RESET_CMD) {
@@ -232,29 +226,31 @@ void handleSerialLine(const std::string& line) {
       memset(OPENDMS_STATIC_PUBLIC_KEY, 0, duckcrypto::PUBLIC_KEY_LENGTH);
       loginfo_ln("OpenDmsConfig: key reset, ready for re-provisioning");
     }
-    return;
+    return true;
   }
 
   if (line.rfind(WRITE_PREFIX, 0) == 0) {
     if (isConfigured()) {
       logerr_ln("OpenDmsConfig: already configured -- send "
                 "AT+OPENDMSKEY+RESET first to re-provision");
-      return;
+      return true;
     }
     std::string hex = line.substr(WRITE_PREFIX.size());
     uint8_t key[duckcrypto::PUBLIC_KEY_LENGTH];
     if (!hexDecodeKey(hex, key)) {
       logerr_ln("OpenDmsConfig: expected %u hex characters (got %u)",
                 (unsigned)KEY_HEX_LENGTH, (unsigned)hex.size());
-      return;
+      return true;
     }
     int rc = saveToStorage(key);
     if (rc == DUCK_ERR_NONE) {
       memcpy(OPENDMS_STATIC_PUBLIC_KEY, key, duckcrypto::PUBLIC_KEY_LENGTH);
       loginfo_ln("OpenDmsConfig: provisioned successfully");
     }
-    return;
+    return true;
   }
+
+  return false;
 }
 
 } // namespace
@@ -286,21 +282,8 @@ bool isConfigured() {
   return memcmp(OPENDMS_STATIC_PUBLIC_KEY, zero, duckcrypto::PUBLIC_KEY_LENGTH) != 0;
 }
 
-void checkSerialProvisioning() {
-  while (Serial.available() > 0) {
-    char c = static_cast<char>(Serial.read());
-    if (c == '\n' || c == '\r') {
-      if (!serialLineBuffer.empty()) {
-        handleSerialLine(serialLineBuffer);
-        serialLineBuffer.clear();
-      }
-    } else {
-      serialLineBuffer += c;
-      if (serialLineBuffer.size() > MAX_SERIAL_LINE_LENGTH) {
-        serialLineBuffer.clear();
-      }
-    }
-  }
+bool tryHandleSerialLine(const std::string& line) {
+  return handleSerialLine(line);
 }
 
 } // namespace opendmsconfig

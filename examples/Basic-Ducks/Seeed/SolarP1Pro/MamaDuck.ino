@@ -28,9 +28,10 @@
  *   - LEDs are on P0 (PIN_LED1=P0.15, PIN_LED2=P0.19), not P1 like
  *     WioTrackerL1 -- BLINK_LED/HardFault_Handler raw-register blink
  *     helpers use NRF_P0 instead of NRF_P1.
- *   - CANCEL_BUTTON_ACTIVE_PULLUP is false for this board (external pull
- *     assumed) -- the button pin is configured as plain INPUT, not
- *     INPUT_PULLUP.
+ *   - CANCEL_BUTTON_ACTIVE_PULLUP is false in variant.h (external pull
+ *     assumed), but that assumption proved unreliable on real hardware --
+ *     the pin never read HIGH after release. The sketch overrides this
+ *     and configures the button as INPUT_PULLUP instead of plain INPUT.
  *   - Pin roles were cross-referenced from meshcore-dev/MeshCore's shipped
  *     variants/sensecap_solar/ port (same physical hardware), since Seeed
  *     does not publish a carrier-board schematic for this product -- see
@@ -540,6 +541,15 @@ static BtnEvent checkButton() {
     // trigger unintended single/double/triple-click mode changes.
     static bool     rawDown       = false;
     static uint32_t rawChangeMs   = 0;
+    // Set once BTN_HOLD_2S fires while still physically held (fast path),
+    // which forces wasDown=false even though the button never actually
+    // released -- without this gate, the very next call would misread the
+    // still-down button as a brand new press and restart a fresh HOLD_MS
+    // timer, causing BTN_HOLD_2S to keep re-firing every HOLD_MS for as
+    // long as the button stays held (confirmed via serial log: "BTN_HOLD_2S
+    // fired" repeating indefinitely while held). Cleared as soon as the
+    // button is observed released.
+    static bool     holdConsumedThisPress = false;
 
     const uint32_t HOLD_MS        = SOS_HOLD_MS;
     const uint32_t CLICK_GAP      = 400;   // max ms between clicks in a multi-click burst
@@ -557,7 +567,11 @@ static BtnEvent checkButton() {
         btnDown = rawDown;
     }
 
-    if (btnDown && !wasDown) {
+    if (!btnDown) {
+        holdConsumedThisPress = false;
+    }
+
+    if (btnDown && !wasDown && !holdConsumedThisPress) {
         wasDown      = true;
         pressStartMs = millis();
         holdFired    = false;
@@ -586,6 +600,7 @@ static BtnEvent checkButton() {
         holdFired  = true;
         wasDown    = false;
         clickCount = 0;
+        holdConsumedThisPress = true;   // suppress re-arming while still held
         return BTN_HOLD_2S;
     }
     // Button released — also check for hold on release in case polling was
@@ -683,9 +698,11 @@ void setup() {
     digitalWrite(PIN_LED1, LOW);
     pinMode(PIN_LED2, OUTPUT);
     digitalWrite(PIN_LED2, LOW);
-    // CANCEL_BUTTON_ACTIVE_PULLUP is false for this board (variant.h) -- a
-    // plain INPUT is used rather than INPUT_PULLUP, unlike WioTrackerL1.
-    pinMode(CANCEL_BUTTON_PIN, INPUT);   // active LOW (per variant.h)
+    // CANCEL_BUTTON_ACTIVE_PULLUP is false in variant.h (assumes an
+    // external pull), but real-hardware testing showed the pin never
+    // reads HIGH on release without this -- so INPUT_PULLUP is used
+    // instead of plain INPUT, despite what variant.h implies.
+    pinMode(CANCEL_BUTTON_PIN, INPUT_PULLUP);   // active LOW (per variant.h)
 
     // GPS — wake the L76K before starting Serial1. GPS_EN is already driven
     // HIGH (enabled, active-HIGH on this board) once by variant.cpp's
@@ -742,7 +759,7 @@ void setup() {
     digitalWrite(PIN_GPS_STANDBY, HIGH);
 
     // Re-configure button — defensive in case BLE/SD peripheral init disturbed it.
-    pinMode(CANCEL_BUTTON_PIN, INPUT);
+    pinMode(CANCEL_BUTTON_PIN, INPUT_PULLUP);
 
     // Steady "booted and active" indicator. PIN_LED1 is reserved for the
     // transient BLINK_LED()/loop-entry blink diagnostics above and in
@@ -881,17 +898,54 @@ void loop() {
     }
 
     // ── Button ────────────────────────────────────────────────────────────────
+    // Set once BTN_HOLD_2S fires; cleared once systemOff() actually runs.
+    // See the non-blocking release check right after the button dispatch.
+    static bool pendingPowerOff = false;
     BtnEvent btn = checkButton();
 
     if (btn == BTN_HOLD_2S) {
         // This is the board's Power button -- a 2s hold powers the device
         // off (true nRF52 System OFF, lowest power state), it is NOT an SOS
-        // trigger. Pressing the same (active-LOW) button again wakes the
-        // device back up via a full reset/reboot, giving the expected
-        // "press to turn off, press to turn on" behavior.
+        // trigger. The device does not actually enter System OFF here --
+        // see the non-blocking check just below, which waits for the
+        // button to be released first. Pressing the same (active-LOW)
+        // button again wakes the device back up via a full reset/reboot,
+        // giving the expected "press to turn off, press to turn on"
+        // behavior.
         digitalWrite(PIN_LED1, LOW);
         digitalWrite(PIN_LED2, LOW);
-        systemOff(CANCEL_BUTTON_PIN, 0);   // wake_logic=0: wake on pin LOW
+        pendingPowerOff = true;
+        Serial.println("[PWR] BTN_HOLD_2S fired -- waiting for release before System OFF");
+        Serial.flush();
+    }
+
+    // Finish powering off only once the button has actually been released.
+    // systemOff(CANCEL_BUTTON_PIN, 0) arms a wake-on-LOW GPIO SENSE
+    // condition -- calling it while the pin still reads LOW (i.e. still
+    // held) means the wake condition is already satisfied the instant the
+    // chip enters System OFF, so it wakes itself back up almost
+    // immediately (looks like "shuts off then powers back on"). There must
+    // NOT be a forced/timed fallback that calls systemOff() while the pin
+    // is still LOW -- that reintroduces the exact same bug. So we simply
+    // wait, however long it takes, for a genuine release, printing an
+    // occasional reminder (throttled) rather than ever forcing the call
+    // early. Checking this non-blockingly on every loop() iteration
+    // (instead of a blocking busy-wait) avoids starving duck.run()/LoRa
+    // servicing while waiting for release.
+    if (pendingPowerOff) {
+        if (digitalRead(CANCEL_BUTTON_PIN) == HIGH) {
+            pendingPowerOff = false;
+            Serial.println("[PWR] Button released -- entering System OFF now");
+            Serial.flush();
+            systemOff(CANCEL_BUTTON_PIN, 0);   // wake_logic=0: wake on pin LOW
+        } else {
+            static uint32_t lastReminderMs = 0;
+            if (millis() - lastReminderMs >= 2000UL) {
+                lastReminderMs = millis();
+                Serial.println("[PWR] Still waiting for button release before System OFF...");
+                Serial.flush();
+            }
+        }
     }
 
     if (btn == BTN_SINGLE) {

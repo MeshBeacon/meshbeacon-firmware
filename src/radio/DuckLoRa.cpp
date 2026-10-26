@@ -28,8 +28,88 @@ CDPCFG_LORA_CLASS lora = new Module(CDPCFG_PIN_LORA_CS, CDPCFG_PIN_LORA_DIO0,
 #endif
 
 volatile uint16_t DuckLoRa::interruptFlags = 0;
+volatile bool DuckLoRa::interruptTriggered = false;
 volatile bool DuckLoRa::receivedFlag = false;
 volatile bool DuckLoRa::txBusy = false;
+
+#ifdef CDPCFG_LORA_HAS_EXTERNAL_PA
+#include "driver/rtc_io.h"
+
+// Fully powers down the external FEM (both the PA and LNA signal paths are
+// disabled, since CSD/POWER gate the whole chip, not just one path) and
+// latches that low state with rtc_gpio_hold_en() so it survives ESP32 deep
+// sleep, mirroring Heltec's own RadioSleep() reference implementation.
+//
+// Safe to call before any sleep/low-power state: the next
+// setExternalPaMode() call (invoked from setupRadio()/startReceive()/
+// startTransmitData()) always starts with rtc_gpio_hold_dis() on these same
+// pins, so the FEM is correctly un-held and re-powered the moment the radio
+// is used again -- the device remains fully functional on wake.
+static void disableExternalPa() {
+    pinMode(CDPCFG_PIN_LORA_PA_CSD, OUTPUT);
+    digitalWrite(CDPCFG_PIN_LORA_PA_CSD, LOW);
+    delay(1);
+
+    pinMode(CDPCFG_PIN_LORA_PA_POWER, OUTPUT);
+    digitalWrite(CDPCFG_PIN_LORA_PA_POWER, LOW);
+    delay(1);
+
+    rtc_gpio_hold_en((gpio_num_t)CDPCFG_PIN_LORA_PA_CSD);
+    rtc_gpio_hold_en((gpio_num_t)CDPCFG_PIN_LORA_PA_POWER);
+}
+
+// Drives the board's external FEM (front-end module) into either its TX
+// (PA-enabled) or RX (LNA) signal path. RadioLib has no concept of this
+// board-specific external PA/LNA chip, so it must be toggled manually around
+// every TX/RX transition. Sequence and pin roles mirror Heltec's own
+// RadioTx()/RadioRx() reference implementation for USE_KCT8103L_PA (see
+// CDPCFG_PIN_LORA_PA_* comments in the board header for sourcing details).
+//
+// USE_KCT8103L_PA and USE_KCT8103L_LNA (both compile-time, opt-in, and
+// independent of each other) gate the TX and RX paths respectively. If the
+// flag for the path being requested is NOT set, that call instead fully
+// powers down the FEM via disableExternalPa() rather than selecting that
+// path. WARNING: on the KCT8103L, POWER/CSD gate the whole antenna-switch
+// chip, not one path in isolation -- disabling a path you still need may
+// leave the antenna disconnected entirely rather than merely reducing
+// gain. Verify actual TX/RX still works on real hardware before relying on
+// a single-path configuration.
+//
+// This is a free function (not a DuckLoRa member) specifically so the
+// delay() calls below resolve to Arduino's blocking ::delay(), not
+// DuckLoRa::delay(size_t) -- which has a totally different meaning
+// (RX-aware TX backoff) and would silently shadow it if this were a member
+// function called from startTransmitData()/startReceive().
+static void setExternalPaMode(bool transmitting) {
+#if defined(USE_KCT8103L_PA) && defined(USE_KCT8103L_LNA)
+    const bool enableThisPath = true;
+#elif defined(USE_KCT8103L_PA)
+    const bool enableThisPath = transmitting;
+#elif defined(USE_KCT8103L_LNA)
+    const bool enableThisPath = !transmitting;
+#else
+    const bool enableThisPath = false;
+#endif
+    if (!enableThisPath) {
+        disableExternalPa();
+        return;
+    }
+
+    rtc_gpio_hold_dis((gpio_num_t)CDPCFG_PIN_LORA_PA_POWER);
+    pinMode(CDPCFG_PIN_LORA_PA_POWER, OUTPUT);
+    digitalWrite(CDPCFG_PIN_LORA_PA_POWER, HIGH);
+    delay(1);
+
+    rtc_gpio_hold_dis((gpio_num_t)CDPCFG_PIN_LORA_PA_CSD);
+    pinMode(CDPCFG_PIN_LORA_PA_CSD, OUTPUT);
+    digitalWrite(CDPCFG_PIN_LORA_PA_CSD, HIGH);
+    delay(1);
+
+    pinMode(CDPCFG_PIN_LORA_PA_CTX, OUTPUT);
+    digitalWrite(CDPCFG_PIN_LORA_PA_CTX, transmitting ? HIGH : LOW);
+    delay(transmitting ? 2 : 1);
+}
+#endif
 
 // ---- TEMPORARY DIAGNOSTIC INSTRUMENTATION --------------------------------
 // Tracks what frequency we last *told* the radio to use, and how long gaps
@@ -189,6 +269,9 @@ int DuckLoRa::setupRadio(const LoRaConfigParams &config) {
         return DUCKLORA_ERR_SETUP;
     }   
 
+#ifdef CDPCFG_LORA_HAS_EXTERNAL_PA
+    setExternalPaMode(false);
+#endif
     rc = lora.startReceive();
 
     if (rc != RADIOLIB_ERR_NONE) {
@@ -351,6 +434,9 @@ int DuckLoRa::startReceive()
     // changes no behavior other than defending against that reset.
     lora.setPreambleLength(8);
 #endif
+#ifdef CDPCFG_LORA_HAS_EXTERNAL_PA
+    setExternalPaMode(false);
+#endif
     int state = lora.startReceive();
 
     if (state != RADIOLIB_ERR_NONE) {
@@ -425,6 +511,12 @@ int DuckLoRa::sleep()
         logerr_ln("ERROR  sleep failed");
         rc = DUCKLORA_ERR_SLEEP;
     }
+#ifdef CDPCFG_LORA_HAS_EXTERNAL_PA
+    // Power down the FEM (PA+LNA) too. setExternalPaMode() always un-holds
+    // and re-drives these pins before the next TX/RX, so this is reversible
+    // and does not affect functionality on wake.
+    disableExternalPa();
+#endif
     return rc;
 }
 
@@ -437,6 +529,17 @@ void DuckLoRa::serviceInterruptFlags() {
         }
         s_diagLastServiceMs = nowMs;
     }
+
+    // The ISR (onInterrupt()) only sets this flag -- it must not touch SPI
+    // itself (see onInterrupt()'s doc comment in DuckLoRa.h). The actual
+    // lora.getIrqFlags() SPI transaction happens here instead, safely on
+    // the main loop task.
+    if (!DuckLoRa::interruptTriggered) {
+        return;
+    }
+    DuckLoRa::interruptTriggered = false;
+    DuckLoRa::interruptFlags = lora.getIrqFlags();
+
     if (DuckLoRa::interruptFlags != 0) {
 
 #ifdef CDPCFG_RADIO_SX1262
@@ -544,8 +647,11 @@ void DuckLoRa::serviceInterruptFlags() {
 }
 
 // IMPORTANT: this function MUST be 'void' type and MUST NOT have any arguments!
+// Runs in true hardware interrupt context -- must only set a flag. See the
+// doc comment on the declaration in DuckLoRa.h for why calling
+// lora.getIrqFlags() (an SPI transaction) directly here is unsafe on ESP32.
 void DuckLoRa::onInterrupt(void) {
-    interruptFlags = lora.getIrqFlags();
+    interruptTriggered = true;
 }
 
 int DuckLoRa::startTransmitData(uint8_t* data, int length) {
@@ -585,6 +691,9 @@ int DuckLoRa::startTransmitData(uint8_t* data, int length) {
     // nothing else can start a second transmit while this one is still
     // physically going out over the air (see isTransmitting()'s doc comment).
     txBusy = true;
+#ifdef CDPCFG_LORA_HAS_EXTERNAL_PA
+    setExternalPaMode(true);
+#endif
     tx_err = lora.startTransmit(data, length);
     switch (tx_err) {
         case RADIOLIB_ERR_NONE:

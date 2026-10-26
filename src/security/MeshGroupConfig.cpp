@@ -52,12 +52,6 @@ constexpr int EEPROM_TOTAL_SIZE = 536;
 constexpr uint8_t KEY_MAGIC = 0xDB; // "Duck group key" (0xDA is OpenDmsConfig's)
 
 constexpr size_t KEY_HEX_LENGTH = duckcrypto::KEY_LENGTH * 2;
-// Generous bound on a serial provisioning line's length, well above the
-// longest valid command ("AT+MESHKEY=" + 64 hex chars), just to keep
-// stray/unterminated line noise from growing this buffer unbounded.
-constexpr size_t MAX_SERIAL_LINE_LENGTH = 128;
-
-std::string serialLineBuffer;
 
 // CRC-8-CCITT (poly 0x07) over the stored group key, used only to detect
 // flash/file corruption -- NOT a security/authentication primitive. A
@@ -209,7 +203,7 @@ std::string hexEncodeKey(const uint8_t* key) {
   return out;
 }
 
-void handleSerialLine(const std::string& line) {
+bool handleSerialLine(const std::string& line) {
   static const std::string WRITE_PREFIX = "AT+MESHKEY=";
   static const std::string RESET_CMD = "AT+MESHKEY+RESET";
   static const std::string QUERY_CMD = "AT+MESHKEY?";
@@ -221,7 +215,7 @@ void handleSerialLine(const std::string& line) {
     } else {
       loginfo_ln("MeshGroupConfig: not configured (all-zero placeholder)");
     }
-    return;
+    return true;
   }
 
   if (line == RESET_CMD) {
@@ -230,29 +224,31 @@ void handleSerialLine(const std::string& line) {
       memset(MESH_GROUP_KEY, 0, duckcrypto::KEY_LENGTH);
       loginfo_ln("MeshGroupConfig: key reset, ready for re-provisioning");
     }
-    return;
+    return true;
   }
 
   if (line.rfind(WRITE_PREFIX, 0) == 0) {
     if (isConfigured()) {
       logerr_ln("MeshGroupConfig: already configured -- send "
                 "AT+MESHKEY+RESET first to re-provision");
-      return;
+      return true;
     }
     std::string hex = line.substr(WRITE_PREFIX.size());
     uint8_t key[duckcrypto::KEY_LENGTH];
     if (!hexDecodeKey(hex, key)) {
       logerr_ln("MeshGroupConfig: expected %u hex characters (got %u)",
                 (unsigned)KEY_HEX_LENGTH, (unsigned)hex.size());
-      return;
+      return true;
     }
     int rc = saveToStorage(key);
     if (rc == DUCK_ERR_NONE) {
       memcpy(MESH_GROUP_KEY, key, duckcrypto::KEY_LENGTH);
       loginfo_ln("MeshGroupConfig: provisioned successfully");
     }
-    return;
+    return true;
   }
+
+  return false;
 }
 
 } // namespace
@@ -282,21 +278,8 @@ bool isConfigured() {
   return memcmp(MESH_GROUP_KEY, zero, duckcrypto::KEY_LENGTH) != 0;
 }
 
-void checkSerialProvisioning() {
-  while (Serial.available() > 0) {
-    char c = static_cast<char>(Serial.read());
-    if (c == '\n' || c == '\r') {
-      if (!serialLineBuffer.empty()) {
-        handleSerialLine(serialLineBuffer);
-        serialLineBuffer.clear();
-      }
-    } else {
-      serialLineBuffer += c;
-      if (serialLineBuffer.size() > MAX_SERIAL_LINE_LENGTH) {
-        serialLineBuffer.clear();
-      }
-    }
-  }
+bool tryHandleSerialLine(const std::string& line) {
+  return handleSerialLine(line);
 }
 
 } // namespace meshgroupconfig

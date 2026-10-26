@@ -79,12 +79,6 @@ constexpr int EEPROM_TOTAL_SIZE = 536;
 // MeshGroupConfig's 0xDB and DuckIdentity's 0xDC.
 constexpr uint8_t REGION_MAGIC = 0xDD;
 
-// Generous bound on a serial provisioning line's length, well above the
-// longest valid command ("AT+RADIOREGION=" + 2-char code).
-constexpr size_t MAX_SERIAL_LINE_LENGTH = 64;
-
-std::string serialLineBuffer;
-
 // CRC-8-CCITT (poly 0x07) over the stored region id byte, used only to
 // detect flash/file corruption -- NOT a security/authentication
 // primitive, matching the pattern in DuckIdentity.cpp/OpenDmsConfig.cpp/
@@ -209,14 +203,14 @@ int eraseStorage() {
 #endif
 }
 
-void handleSerialLine(const std::string& line) {
+bool handleSerialLine(const std::string& line) {
   static const std::string WRITE_PREFIX = "AT+RADIOREGION=";
   static const std::string RESET_CMD = "AT+RADIOREGION+RESET";
   static const std::string QUERY_CMD = "AT+RADIOREGION?";
 
   if (line == QUERY_CMD) {
     loginfo_ln("RadioRegionConfig: current region = %s", regionName(currentRegion));
-    return;
+    return true;
   }
 
   if (line == RESET_CMD) {
@@ -228,7 +222,7 @@ void handleSerialLine(const std::string& line) {
       delay(300);  // let the serial response flush before resetting
       duckesp::restartDuck();
     }
-    return;
+    return true;
   }
 
   if (line.rfind(WRITE_PREFIX, 0) == 0) {
@@ -236,7 +230,7 @@ void handleSerialLine(const std::string& line) {
     RadioRegion region;
     if (!regionFromName(code, &region)) {
       logerr_ln("RadioRegionConfig: unrecognized region code '%s'", code.c_str());
-      return;
+      return true;
     }
     int rc = setRegion(region);
     if (rc == DUCK_ERR_NONE) {
@@ -245,8 +239,10 @@ void handleSerialLine(const std::string& line) {
       delay(300);  // let the serial response flush before resetting
       duckesp::restartDuck();
     }
-    return;
+    return true;
   }
+
+  return false;
 }
 
 } // namespace
@@ -297,21 +293,8 @@ bool regionFromName(const std::string& code, RadioRegion* outRegion) {
   return false;
 }
 
-void checkSerialProvisioning() {
-  while (Serial.available() > 0) {
-    char c = static_cast<char>(Serial.read());
-    if (c == '\n' || c == '\r') {
-      if (!serialLineBuffer.empty()) {
-        handleSerialLine(serialLineBuffer);
-        serialLineBuffer.clear();
-      }
-    } else {
-      serialLineBuffer += c;
-      if (serialLineBuffer.size() > MAX_SERIAL_LINE_LENGTH) {
-        serialLineBuffer.clear();
-      }
-    }
-  }
+bool tryHandleSerialLine(const std::string& line) {
+  return handleSerialLine(line);
 }
 
 } // namespace radioregionconfig

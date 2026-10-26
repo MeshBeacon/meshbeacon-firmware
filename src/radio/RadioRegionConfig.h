@@ -13,7 +13,7 @@
  * A region can be set two ways, mirroring OpenDmsConfig.h/MeshGroupConfig.h:
  *  - field provisioning: begin() loads a previously field-provisioned
  *    region from flash if one was written via the serial provisioning
- *    command (see checkSerialProvisioning()), and applies it to
+ *    command (see tryHandleSerialLine()), and applies it to
  *    DuckLoRa::defaultRadioParams.band and DuckLoRa::uplinkChannelPool
  *    before the radio is initialized.
  *  - a future BLE-writable characteristic/mobile app settings screen can
@@ -117,7 +117,7 @@ int setRegion(RadioRegion region);
 /**
  * @brief Field-provision the LoRa region over the USB serial console.
  *
- * Polls Serial for a complete line and, if present, handles one of:
+ * Handles one complete line at a time, recognizing one of:
  *  - "AT+RADIOREGION=<code>": sets and persists the region, where
  *    <code> is one of MY, SG, PH, ID, US, UK, PS. Unlike OpenDmsConfig's key
  *    provisioning, this can be re-sent at any time to switch regions --
@@ -130,9 +130,20 @@ int setRegion(RadioRegion region);
  * the device shortly afterward (see setRegion()) so the new mesh
  * channel/uplink pool takes effect immediately, without requiring the
  * operator to power-cycle the device manually.
- * Should be polled once per main loop iteration.
+ *
+ * Does NOT read Serial itself -- callers (Duck::run()'s centralized
+ * serial line reader) own reading/buffering Serial and pass each
+ * completed line here. This keeps there from being multiple independent
+ * competing Serial.read() consumers, which previously raced with each
+ * other (and with application code) and silently dropped host->device
+ * bytes.
+ *
+ * @param line a complete line read from Serial (no trailing \\n/\\r).
+ * @return true if this line matched one of this module's commands and
+ *         was handled, false if it was not recognized (caller should try
+ *         another handler, or treat it as application data).
  */
-void checkSerialProvisioning();
+bool tryHandleSerialLine(const std::string& line);
 
 } // namespace radioregionconfig
 
